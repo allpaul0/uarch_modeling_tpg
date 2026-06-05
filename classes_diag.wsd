@@ -1,0 +1,93 @@
+@startuml
+
+' =====================================
+' TPG DOMAIN
+' =====================================
+
+class TPG {
+    + name : String
+    + dtype : String
+    + GPIS : List<String>
+}
+
+class Team {
+    + id : Integer
+    + code : String
+    + nbTeamMeasurements : Integer
+    ' + idProgs : List<Integer>
+}
+
+class Instruction {
+    + mnemonic : String
+    + operands : List<String>
+}
+
+TPG "1" *-- "1..*" Team
+Team "1" *-- "1..*" Instruction
+
+' =====================================
+' MICROARCHITECTURE
+' =====================================
+
+class Uarch {
+    + name : String
+    + isa : String
+    + abi : String
+}
+
+' =====================================
+' MEASURED PERFORMANCE
+' =====================================
+
+class TeamMeasurement {
+    + latency : Float
+}
+
+Team "1" *-- "0..*" TeamMeasurement
+Uarch "1" *-- "0..*" TeamMeasurement
+Team "1" *-- "1" FeatureVector
+
+' =====================================
+' FEATURE EXTRACTION
+' =====================================
+
+class FeatureVector {
+    ' Created from instructions, table of features 
+    ' {"ADD_count": 3, "LOAD_count": 5, "RAW_hazards": 2, "ADD_ADD_transition": 1}
+    + values : Map<String, Float>
+}
+
+class Disassembler {
+    + parseAssembly(code : String) : List<Instruction>
+}
+
+class FeaturesAnalyzer {
+    + analyzeInstructions(instructions : List<Instruction>) : FeatureVector
+}
+
+Disassembler ..> Team : parses
+Disassembler ..> Instruction : produces
+
+FeaturesAnalyzer ..> Instruction : analyzes
+FeaturesAnalyzer ..> FeatureVector : produces
+
+' =====================================
+' LATENCY MODEL
+' =====================================
+
+class RegressionModel {
+    ' weights = { "ADD_count": 0.12, "LOAD_count": 1.85, "RAW_hazards": 3.40, "ADD_ADD_transition": 0.75'
+    + weights : Map<String, Float>
+    + bias : Float
+}
+
+class Regressor {
+    + train(features : List<FeatureVector>, latencies : List<Float>) : RegressionModel
+    + predict(features : FeatureVector) : Float
+}
+
+Regressor ..> RegressionModel : produces model
+Regressor ..> FeatureVector : takes training data
+Regressor ..> TeamMeasurement : takes latency labels
+
+@enduml
