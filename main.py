@@ -15,8 +15,8 @@ Usage
     # Print all teams for a specific uarch
     python main.py inspect --db <path> --uarch <uarch_name> [--max-teams N]
 
-    # Train a regression model for a specific uarch
-    python main.py train --db <path> --uarch <uarch_name>
+    # Train a Lasso regression model for a specific uarch (80/20 split)
+    python main.py train --db <path> --uarch <uarch_name> [--test-size 0.2] [--seed 42]
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from analysis.regression import Regressor
 
 
 def cmd_load(args: argparse.Namespace) -> None:
-    # Start from an existing database if provided
     if args.db and __import__("pathlib").Path(args.db).exists():
         db = Database.load(args.db)
     else:
@@ -68,21 +67,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         for t in teams if t.feature_vector
     ]
 
-    print(f"[train] Training on {len(feature_vectors)} samples for uarch={args.uarch!r}")
-    model = Regressor.train(feature_vectors, latencies)
-    print(f"[train] {model}")
-
-    # Quick leave-one-out sanity check on first team
-    t0 = teams[0]
-    if t0.feature_vector:
-        pred = Regressor.predict(model, t0.feature_vector)
-        actual = next(m.latency for m in t0.measurements if m.uarch.name == args.uarch)
-        print(f"\n[train] Team {t0.id}: actual={actual:.2f}  predicted={pred:.2f}")
-    t1 = teams[1]
-    if t1.feature_vector:
-        pred = Regressor.predict(model, t1.feature_vector)
-        actual = next(m.latency for m in t1.measurements if m.uarch.name == args.uarch)
-        print(f"\n[train] Team {t1.id}: actual={actual:.2f}  predicted={pred:.2f}")
+    print(f"[train] {len(feature_vectors)} samples  uarch={args.uarch!r}")
+    model = Regressor.train(
+        feature_vectors,
+        latencies,
+        test_size=args.test_size,
+        random_state=args.seed,
+    )
+    model.print_report()
 
 
 def main() -> None:
@@ -111,9 +103,13 @@ def main() -> None:
                        help="Limit number of teams printed")
 
     # ── train ─────────────────────────────────────────────────────────────
-    p_tr = sub.add_parser("train", help="Train a regression model for one uarch")
-    p_tr.add_argument("--db",    required=True, help="Database file")
-    p_tr.add_argument("--uarch", required=True, help="Uarch name to train on")
+    p_tr = sub.add_parser("train", help="Train a Lasso model for one uarch")
+    p_tr.add_argument("--db",        required=True, help="Database file")
+    p_tr.add_argument("--uarch",     required=True, help="Uarch name to train on")
+    p_tr.add_argument("--test-size", type=float, default=0.20,
+                      help="Fraction held out for testing (default: 0.20)")
+    p_tr.add_argument("--seed",      type=int,   default=42,
+                      help="Random seed for the train/test split (default: 42)")
 
     args = parser.parse_args()
 
