@@ -5,16 +5,14 @@ from classes.instruction import Instruction
 from classes.features import FeatureVector
 
 # ---------------------------------------------------------------------------
-# Instruction categories used for feature extraction
+# Instruction categories — kept for use in RAW hazard / register analysis
+# only.  They are NOT used to produce category-level count features because
+# those would be linear combinations of the per-mnemonic counts.
 # ---------------------------------------------------------------------------
 
-_MEM_LOADS  = {"lw", "lh", "lb", "lhu", "lbu"}
 _MEM_STORES = {"sw", "sh", "sb"}
 _BRANCHES   = {"beq", "bne", "blt", "bge", "bltu", "bgeu"}
 _JUMPS      = {"jal", "jalr"}
-_MUL        = {"mul", "mulh", "mulhu", "mulhsu"}
-_DIV        = {"div", "divu", "rem", "remu"}
-_CSR        = {"csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci"}
 
 
 class FeaturesAnalyzer:
@@ -23,13 +21,23 @@ class FeaturesAnalyzer:
 
     Features produced
     -----------------
-    Per-mnemonic counts   → "<MNEM>_count"
-    Category counts       → "load_count", "store_count", "branch_count",
-                             "jump_count", "mul_count", "div_count",
-                             "csr_count", "other_count"
-    RAW hazard estimate   → "raw_hazards"
-    Bigram transitions    → "<A>_<B>_transition"
-    Total instructions    → "total_instructions"
+    Per-mnemonic counts  → "<MNEM>_count"
+        One entry per distinct mnemonic observed.  These are the atomic,
+        independent count features.  Category-level aggregates (load_count,
+        store_count, …) are intentionally NOT included: they are exact linear
+        combinations of the per-mnemonic counts (e.g. load_count = lw_count +
+        lh_count + …) and would introduce perfect multicollinearity, corrupting
+        any linear model including Lasso.  total_instructions is likewise the
+        sum of all per-mnemonic counts and is excluded for the same reason.
+
+    RAW hazard estimate  → "raw_hazards"
+        Count of Read-After-Write hazards within a 2-instruction look-back
+        window.  This is a derived structural feature not expressible as a
+        linear combination of mnemonic counts, so it is kept.
+
+    Bigram transitions   → "<A>_<B>_transition"
+        Counts of consecutive mnemonic pairs.  These capture instruction-
+        ordering information that individual counts cannot express.
     """
 
     # ------------------------------------------------------------------ #
@@ -59,24 +67,12 @@ class FeaturesAnalyzer:
         mnemonics = [i.mnemonic.lower() for i in instructions]
 
         # -- Per-mnemonic counts ------------------------------------------
+        # Each mnemonic gets its own independent count feature.
+        # No category aggregates and no total_instructions — they are linear
+        # combinations of these counts and must not appear alongside them.
         mnem_counts = Counter(mnemonics)
         for mnem, cnt in mnem_counts.items():
             values[f"{mnem}_count"] = float(cnt)
-
-        # -- Category counts ----------------------------------------------
-        values["load_count"]   = float(sum(mnem_counts[m] for m in _MEM_LOADS  if m in mnem_counts))
-        values["store_count"]  = float(sum(mnem_counts[m] for m in _MEM_STORES if m in mnem_counts))
-        values["branch_count"] = float(sum(mnem_counts[m] for m in _BRANCHES   if m in mnem_counts))
-        values["jump_count"]   = float(sum(mnem_counts[m] for m in _JUMPS      if m in mnem_counts))
-        values["mul_count"]    = float(sum(mnem_counts[m] for m in _MUL        if m in mnem_counts))
-        values["div_count"]    = float(sum(mnem_counts[m] for m in _DIV        if m in mnem_counts))
-        values["csr_count"]    = float(sum(mnem_counts[m] for m in _CSR        if m in mnem_counts))
-
-        known = _MEM_LOADS | _MEM_STORES | _BRANCHES | _JUMPS | _MUL | _DIV | _CSR
-        values["other_count"] = float(sum(cnt for m, cnt in mnem_counts.items() if m not in known))
-
-        # -- Total instructions -------------------------------------------
-        values["total_instructions"] = float(len(instructions))
 
         # -- RAW hazard estimate ------------------------------------------
         values["raw_hazards"] = float(FeaturesAnalyzer._count_raw_hazards(instructions))
