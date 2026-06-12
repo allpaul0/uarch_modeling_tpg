@@ -1,5 +1,4 @@
 from __future__ import annotations
-import re
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -9,67 +8,24 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class Instruction:
-    """
-    A single disassembled RISC-V instruction belonging to a Team.
-    """
-    mnemonic: str
-    operands: list[str]
-    raw: str = ""
-
-    def __repr__(self) -> str:
-        return (
-            f"Instruction(mnemonic={self.mnemonic!r}, "
-            f"operands={self.operands})"
-        )
-
-    @staticmethod
-    def parse(asm: str) -> "Instruction":
-        """
-        Parse a single RISC-V assembly string such as:
-            'sw  a5,-172(s0)'
-            'addi a5,a5,4'
-            'li   a5,0'
-        """
-        asm = asm.strip()
-        parts = asm.split(None, 1)
-        mnemonic = parts[0]
-        operands_part = parts[1] if len(parts) > 1 else ""
-
-        raw_operands = [op.strip() for op in operands_part.split(",") if op.strip()]
-
-        operands: list[str] = []
-
-        for op in raw_operands:
-            # Case 1: pure immediate (e.g. 4, -172, 0)
-            if re.fullmatch(r"-?\d+", op):
-                operands.append("CONST")
-                continue
-
-            # Case 2: memory operand like -172(s0)
-            m = re.fullmatch(r"(-?\d+)\((\w+)\)", op)
-            if m:
-                # split into CONST + register
-                operands.append("CONST")
-                operands.append(m.group(2))
-                continue
-
-            # Case 3: normal register (a5, s0, etc.)
-            operands.append(op)
-
-        return Instruction(
-            mnemonic=mnemonic,
-            operands=operands,
-            raw=asm,
-        )
-
-
-@dataclass
 class Team:
     """
-    A Team corresponds to one code block / program group in the TPG.
-    It owns a list of Instructions, a list of TeamMeasurements,
-    and one FeatureVector.
+    A Team corresponds to one basic block in the TPG.
+
+    Attributes
+    ----------
+    id:                   Integer identifier (matches T<id>_start in the
+                          disassembly).
+    code:                 Raw disassembly text of the block, exactly as it
+                          appears between the T<id>_start and T<id>_end
+                          label lines in the objdump output.
+    nb_team_measurements: Total number of individual measurement runs across
+                          all TeamMeasurements attached to this team.  This
+                          is the sum of TeamMeasurement.nb_measurements, not
+                          simply the number of TeamMeasurement objects.
+    instructions:         Ordered list of Instructions in the block.
+    measurements:         List of TeamMeasurements (one per uarch typically).
+    feature_vector:       Extracted feature representation of the block.
     """
     id: int
     code: str
@@ -94,7 +50,10 @@ class Team:
 
     def add_measurement(self, measurement: "TeamMeasurement") -> None:
         self.measurements.append(measurement)
-        self.nb_team_measurements = len(self.measurements)
+        # nb_team_measurements is the total run count, not the list length
+        self.nb_team_measurements = sum(
+            m.nb_measurements for m in self.measurements
+        )
 
     def get_latencies(self) -> list[float]:
         """Return all recorded latencies for this team."""
@@ -112,8 +71,11 @@ class Team:
         self.feature_vector = fv
 
     def __repr__(self) -> str:
+        # Show only the first line of code so repr stays readable in a loop
+        first_line = self.code.splitlines()[0] if self.code else ""
         return (
-            f"Team(id={self.id}, code={self.code!r}, "
+            f"Team(id={self.id}, "
             f"instructions={len(self.instructions)}, "
-            f"measurements={self.nb_team_measurements})"
+            f"nb_measurements={self.nb_team_measurements}, "
+            f"code_start={first_line!r})"
         )

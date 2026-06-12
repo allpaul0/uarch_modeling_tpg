@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import Counter
 
-from classes.team import Instruction
+from classes.instruction import Instruction
 from classes.features import FeatureVector
 
 # ---------------------------------------------------------------------------
