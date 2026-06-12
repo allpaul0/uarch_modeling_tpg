@@ -156,8 +156,11 @@ class Database:
 
     def print_summary(self) -> None:
         """Print a high-level overview: uarchs, TPGs, and team counts."""
+        total_teams    = sum(len(tpg.teams) for tpg in self.tpgs.values())
+
         print("\n" + "═" * 70)
         print(f"  DATABASE SUMMARY  —  {len(self.tpgs)} TPGs  ·  {len(self.uarchs)} Uarchs")
+        print(f"  Teams: {total_teams} total")
         print("═" * 70)
 
         print("\n  Uarchs:")
@@ -173,7 +176,8 @@ class Database:
                 for m in team.measurements
             })
             print(f"    {tpg.name}")
-            print(f"      dtype={tpg.dtype}  teams={len(tpg.teams)}"
+            print(f"      dtype={tpg.dtype}"
+                  f"  teams={len(tpg.teams)}"
                   f"  uarchs={uarch_names}")
         print("═" * 70)
 
