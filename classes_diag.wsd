@@ -40,7 +40,9 @@ class Uarch {
 ' =====================================
 
 class TeamMeasurement {
-    + latency : Float
+    + latencyAvg : Float
+    + latencyStdDev : Float
+    + count : int
 }
 
 Team "1" *-- "0..*" TeamMeasurement

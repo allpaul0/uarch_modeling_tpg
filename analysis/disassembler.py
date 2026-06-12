@@ -34,18 +34,30 @@ INSTRUCTION_LATENCY: dict[str, int] = {
 }
 
 # Regex matching one disassembled line:
-#   <addr>:  <machine-code>   <mnemonic> [operands]   [# optional comment]
-_LINE_RE = re.compile(r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+(.+?)(?:\s*#.*)?$")
+#   <addr>:  <machine-code>   <mnemonic> [operands]   [<label>]   [# comment]
+#
+# objdump appends two kinds of trailing annotation that are NOT operands:
+#
+#   1. Bare label:   "blez a7,886 <T2_start+0x1e>"
+#      Captured by  (?:\s+<\S+>)?   before the optional # comment.
+#
+#   2. Hash comment: "lw a7,4(a3) # 20000004 <_sp+…>"
+#      Captured by  (?:\s*#.*)?
+#
+# The non-greedy (.+?) stops before either optional suffix, so group 1
+# always contains only mnemonic + clean operands.
+_LINE_RE = re.compile(
+    r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+(.+?)(?:\s+<\S+>)?(?:\s*#.*)?$"
+)
 
 # Matches an exact team label line, e.g. "000007c2 <T0_start>:"
-# The leading ^ and trailing \s*$ prevent false positives from inline
-# references like "# 1264 <T21_start>" that appear inside instruction lines.
 _TEAM_LABEL_RE = re.compile(r"^[0-9a-f]{8} <T(\d+)_(start|end)>:\s*$")
 
-# The first instruction inside T_start is always "csrr <rd>,mcycle" — a
-# timing probe inserted by the test harness.  It must be stripped from the
-# instruction list and from Team.code.
-_MCYCLE_PROBE_RE = re.compile(r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+csrr\s+\w+,mcycle")
+# The first instruction inside T_start is always "csrr <rd>,mcycle" —
+# a timing probe inserted by the test harness. Strip it from code & instrs.
+_MCYCLE_PROBE_RE = re.compile(
+    r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+csrr\s+\w+,mcycle"
+)
 
 
 @dataclass
@@ -58,9 +70,8 @@ class TeamBlock:
     team_id:      Integer from the T<N>_start label.
     instructions: Ordered list of Instructions (timing probe excluded).
     code:         Raw disassembly text of the block — the label lines plus
-                  every instruction line, exactly as printed by objdump,
+                  every instruction line exactly as printed by objdump,
                   with the ``csrr mcycle`` timing probe line stripped.
-                  This is the value stored in Team.code.
     """
     team_id: int
     instructions: list[Instruction]
@@ -91,8 +102,8 @@ class TPGLatencyData:
     tpg_mean_lat:   Mean latency of the whole TPG (cycles).
     tpg_stddev_lat: Stddev of the whole-TPG latency (cycles).
     team_latencies: Dict mapping team_id → TeamLatency.  Only teams that
-                    appear in the JSON "Teams" array (non-zero latency) are
-                    present; zero-latency teams are absent.
+                    appear in the JSON "Teams" array are present; zero-
+                    latency teams are absent.
     """
     simulator: str
     isa: str
@@ -109,8 +120,7 @@ class TPGLatencyData:
 
 class Disassembler:
     """
-    Parses raw RISC-V assembly text (e.g. output of objdump -d) into
-    Instruction objects.
+    Parses raw RISC-V assembly text (objdump -d output) into Instruction objects.
 
     All methods are static — no instance state needed.
     """
@@ -124,12 +134,6 @@ class Disassembler:
         """
         Parse a multi-line assembly string and return one Instruction per
         decoded line.  Comment-only lines and blank lines are silently skipped.
-
-        Args:
-            code: Raw text from objdump (or similar disassembler).
-
-        Returns:
-            Ordered list of Instruction objects.
         """
         instructions: list[Instruction] = []
         for line in code.splitlines():
@@ -140,15 +144,7 @@ class Disassembler:
 
     @staticmethod
     def parse_file(path: str) -> list[Instruction]:
-        """
-        Convenience wrapper: read a file and call parse_assembly.
-
-        Args:
-            path: Path to the objdump output file.
-
-        Returns:
-            Ordered list of Instruction objects.
-        """
+        """Convenience wrapper: read a file and call parse_assembly."""
         with open(path, "r") as fh:
             return Disassembler.parse_assembly(fh.read())
 
@@ -167,29 +163,16 @@ class Disassembler:
                 …
             0000080c <T0_end>:
 
-        For each team the method returns a :class:`TeamBlock` containing:
-
-        * ``instructions`` — parsed :class:`Instruction` objects, with the
-          ``csrr mcycle`` timing probe removed.
-        * ``code`` — the raw objdump text of the block (label lines + all
-          instruction lines), again with the probe line removed.  This is
-          what callers store in ``Team.code`` so the original disassembly is
-          always accessible.
-
-        Lines that fall between a ``T_end`` and the next ``T_start`` (harness
-        glue code) are silently ignored.
-
-        Args:
-            path: Path to the objdump output file.
+        The ``csrr mcycle`` timing probe (first line after each T_start label)
+        is stripped from both the instruction list and the raw code text.
 
         Returns:
-            ``{team_id: TeamBlock}`` — one entry per team found in the file.
+            ``{team_id: TeamBlock}`` — one entry per team in the file.
         """
         blocks: dict[int, TeamBlock] = {}
-
         current_id: int | None = None
         probe_consumed: bool = False
-        raw_lines: list[str] = []          # accumulates text for Team.code
+        raw_lines: list[str] = []
         instructions: list[Instruction] = []
 
         with open(path, "r") as fh:
@@ -199,16 +182,15 @@ class Disassembler:
                 label_m = _TEAM_LABEL_RE.match(line)
                 if label_m:
                     tid    = int(label_m.group(1))
-                    marker = label_m.group(2)  # "start" or "end"
+                    marker = label_m.group(2)
 
                     if marker == "start":
                         current_id     = tid
                         probe_consumed = False
-                        raw_lines      = [line]   # include the label line
+                        raw_lines      = [line]
                         instructions   = []
-
                     elif marker == "end" and current_id is not None:
-                        raw_lines.append(line)    # include the end label line
+                        raw_lines.append(line)
                         blocks[current_id] = TeamBlock(
                             team_id=current_id,
                             instructions=instructions,
@@ -218,16 +200,14 @@ class Disassembler:
                     continue
 
                 if current_id is None:
-                    continue   # harness glue between teams — skip
+                    continue   # harness glue — skip
 
-                # First real line after T_start: the mcycle timing probe
                 if not probe_consumed:
                     if _MCYCLE_PROBE_RE.match(line):
-                        probe_consumed = True   # strip probe from code & instrs
-                    # skip blank lines and the probe line itself
-                    continue
+                        probe_consumed = True
+                    continue   # skip probe line itself and any blank lines before it
 
-                # Normal instruction line inside the block
+                # Normal instruction line
                 raw_lines.append(line)
                 instr_m = _LINE_RE.search(line)
                 if instr_m:
@@ -242,24 +222,15 @@ class Disassembler:
     @staticmethod
     def parse_latency_json(path: str) -> TPGLatencyData:
         """
-        Parse a JSON results file produced by the CV32E40X inference pipeline.
-
-        Only the ``instrTeams_instrTPG.Teams`` array is used for per-team
-        latencies.  Teams absent from that array have zero / unmeasured
-        latency and will not appear in ``TPGLatencyData.team_latencies``.
-
-        Args:
-            path: Path to the JSON results file.
-
-        Returns:
-            A populated :class:`TPGLatencyData` instance.
+        Parse a JSON results file.  Only ``instrTeams_instrTPG.Teams`` is used
+        for per-team latencies.
         """
         with open(path, "r") as fh:
             data: dict = json.load(fh)
 
         section = data["instrTeams_instrTPG"]
-
         team_latencies: dict[int, TeamLatency] = {}
+
         for entry in section.get("Teams", []):
             tid = int(entry["Team"])
             team_latencies[tid] = TeamLatency(
@@ -281,7 +252,7 @@ class Disassembler:
         )
 
     # ------------------------------------------------------------------ #
-    # Latency helpers
+    # Latency helpers (table-based estimates)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -289,22 +260,12 @@ class Disassembler:
         """Return the estimated cycle latency for a single instruction."""
         lat = INSTRUCTION_LATENCY.get(instr.mnemonic.lower())
         if lat is None:
-            print(
-                f"Warning: unknown mnemonic '{instr.mnemonic}', "
-                f"using default latency {INTEGER_LATENCY}"
-            )
+            print(f"Warning: unknown mnemonic '{instr.mnemonic}', "
+                  f"using default latency {INTEGER_LATENCY}")
             return INTEGER_LATENCY
         return lat
 
     @staticmethod
     def estimate_block_latency(instructions: list[Instruction]) -> int:
-        """
-        Naïve basic-block latency estimate: sum of per-instruction latencies.
-
-        Args:
-            instructions: Ordered list of Instructions in the block.
-
-        Returns:
-            Total estimated cycles.
-        """
+        """Naïve sum of per-instruction latencies."""
         return sum(Disassembler.instruction_latency(i) for i in instructions)
