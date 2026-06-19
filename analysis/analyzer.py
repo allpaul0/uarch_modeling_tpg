@@ -59,20 +59,18 @@ class FeaturesAnalyzer:
     @staticmethod
     def analyze_instructions(
         instructions: list[Instruction],
-        id_team: int = 0,
     ) -> FeatureVector:
         """
         Analyse a list of Instructions and return a FeatureVector.
 
         Args:
             instructions: Instructions belonging to one Team.
-            id_team:      Team identifier forwarded to the FeatureVector.
 
         Returns:
             A populated FeatureVector.
         """
         if not instructions:
-            return FeatureVector(id_team=id_team, values={})
+            return FeatureVector(values={})
 
         values: dict[str, float] = {}
 
@@ -98,7 +96,7 @@ class FeaturesAnalyzer:
         # -- Length of instructions ---------------------------------------
         values["BB_length"] = len(instructions)
 
-        return FeatureVector(id_team=id_team, values=values)
+        return FeatureVector(values=values)
 
     # ------------------------------------------------------------------ #
     # Private helpers

@@ -8,7 +8,6 @@ class FeatureVector:
     A fixed mapping of feature names → float values extracted from a Team's
     instructions, e.g. {"ADD_count": 3.0, "LOAD_count": 5.0, "RAW_hazards": 2.0}.
     """
-    id_team: int
     values: dict[str, float] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
@@ -41,4 +40,4 @@ class FeatureVector:
             raise ImportError("pandas is required for to_series()") from exc
 
     def __repr__(self) -> str:
-        return f"FeatureVector(id_team={self.id_team}, values={self.values})"
+        return f"FeatureVector(values={self.values})"

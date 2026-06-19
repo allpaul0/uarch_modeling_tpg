@@ -43,11 +43,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
 def _compute_features(db: Database, uarch_name: str) -> None:
     """Compute feature vectors for all CompiledTeams targeting uarch_name."""
     # get_compiled_teams_for_uarch now returns (tpg, team_id, ct) triples.
-    for _tpg, team_id, ct in db.get_compiled_teams_for_uarch(uarch_name):
-        ct.feature_vector = FeaturesAnalyzer.analyze_instructions(
-            ct.instructions, id_team=team_id
-        )
-
+    for _tpg, _team_id, ct in db.get_compiled_teams_for_uarch(uarch_name):
+        ct.feature_vector = FeaturesAnalyzer.analyze_instructions(ct.instructions)
+        
 
 def cmd_inspect(args: argparse.Namespace) -> None:
     db = Database.load(args.db)
