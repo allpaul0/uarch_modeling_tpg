@@ -3,79 +3,74 @@ from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .measurement import TeamMeasurement
+    from .uarch import Uarch
+    from .instruction import Instruction
     from .features import FeatureVector
+    from .teamMeasurements import TeamMeasurement
+
+
+@dataclass
+class CompiledTeam:
+    """
+    A Team compiled for a specific Uarch target.
+
+    One Team produces one CompiledTeam per (uarch, isa, abi) combination.
+    The Uarch reference carries the isa and abi used during compilation.
+
+    Attributes
+    ----------
+    uarch:          The micro-architecture this team was compiled and measured on.
+                    Carries the isa and abi used during compilation.
+    code:           Raw disassembly text of the compiled block.
+    instructions:   Ordered list of disassembled Instructions.
+    feature_vector: Feature representation extracted from instructions.
+    measurement:    Unique latency measurement taken on the target uarch.
+    """
+    uarch: "Uarch"
+    code: str
+    instructions: list["Instruction"] = field(default_factory=list)
+    feature_vector: Optional["FeatureVector"] = None
+    measurement: Optional["TeamMeasurement"] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"CompiledTeam(uarch={self.uarch.name!r}, "
+            f"instructions={len(self.instructions)}, "
+            f"latency={self.measurement.latency:.2f} cycles"
+            f" stddev={self.measurement.stddev:.2f}"
+            if self.measurement else
+            f"CompiledTeam(uarch={self.uarch.name!r}, "
+            f"instructions={len(self.instructions)}, no measurement)"
+        )
 
 
 @dataclass
 class Team:
     """
-    A Team corresponds to one basic block in the TPG.
+    A Team is a basic block node in the TPG, identified by its integer id.
+
+    A Team can be compiled for multiple target uarchs, producing one
+    CompiledTeam per target.  All ISA-dependent data (code, instructions,
+    features, latency) lives on CompiledTeam, not here.
 
     Attributes
     ----------
-    id:                   Integer identifier (matches T<id>_start in the
-                          disassembly).
-    code:                 Raw disassembly text of the block, exactly as it
-                          appears between the T<id>_start and T<id>_end
-                          label lines in the objdump output.
-    nb_team_measurements: Total number of individual measurement runs across
-                          all TeamMeasurements attached to this team.  This
-                          is the sum of TeamMeasurement.nb_measurements, not
-                          simply the number of TeamMeasurement objects.
-    instructions:         Ordered list of Instructions in the block.
-    measurements:         List of TeamMeasurements (one per uarch typically).
-    feature_vector:       Extracted feature representation of the block.
+    id:             Integer identifier (matches T<id>_start in disassembly).
+    compiled_teams: One CompiledTeam per (uarch, isa, abi) compilation.
     """
     id: int
-    code: str
-    nb_team_measurements: int = 0
-    instructions: list[Instruction] = field(default_factory=list)
-    measurements: list["TeamMeasurement"] = field(default_factory=list)
-    feature_vector: Optional["FeatureVector"] = None
+    compiled_teams: list[CompiledTeam] = field(default_factory=list)
 
-    # ------------------------------------------------------------------ #
-    # Instruction helpers
-    # ------------------------------------------------------------------ #
+    def add_compiled_team(self, ct: CompiledTeam) -> None:
+        self.compiled_teams.append(ct)
 
-    def add_instruction(self, instr: Instruction) -> None:
-        self.instructions.append(instr)
-
-    def set_instructions(self, instrs: list[Instruction]) -> None:
-        self.instructions = instrs
-
-    # ------------------------------------------------------------------ #
-    # Measurement helpers
-    # ------------------------------------------------------------------ #
-
-    def add_measurement(self, measurement: "TeamMeasurement") -> None:
-        self.measurements.append(measurement)
-        # nb_team_measurements is the total run count, not the list length
-        self.nb_team_measurements = sum(
-            m.nb_measurements for m in self.measurements
-        )
-
-    def get_latencies(self) -> list[float]:
-        """Return all recorded latencies for this team."""
-        return [m.latency for m in self.measurements]
-
-    def mean_latency(self) -> Optional[float]:
-        lats = self.get_latencies()
-        return sum(lats) / len(lats) if lats else None
-
-    # ------------------------------------------------------------------ #
-    # Feature vector
-    # ------------------------------------------------------------------ #
-
-    def set_feature_vector(self, fv: "FeatureVector") -> None:
-        self.feature_vector = fv
+    def get_compiled_for_uarch(self, uarch_name: str) -> CompiledTeam | None:
+        """Return the CompiledTeam targeting the given uarch, or None."""
+        for ct in self.compiled_teams:
+            if ct.uarch.name == uarch_name:
+                return ct
+        return None
 
     def __repr__(self) -> str:
-        # Show only the first line of code so repr stays readable in a loop
-        first_line = self.code.splitlines()[0] if self.code else ""
-        return (
-            f"Team(id={self.id}, "
-            f"instructions={len(self.instructions)}, "
-            f"nb_measurements={self.nb_team_measurements}, "
-            f"code_start={first_line!r})"
-        )
+        uarchs = [ct.uarch.name for ct in self.compiled_teams]
+        return f"Team(id={self.id}, compiled_for={uarchs})"

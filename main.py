@@ -3,19 +3,10 @@ main.py — CLI for the TPG latency-estimation pipeline.
 
 Usage
 -----
-    # Load a model folder into a new database and save it
     python main.py load <model_root> [--db <path>] [--save <path>]
-
-    # Load a model folder and extend an existing database
     python main.py load <model_root> --db <existing.pkl> --save <existing.pkl>
-
-    # Print a summary of a saved database
     python main.py summary --db <path>
-
-    # Print all teams for a specific uarch
     python main.py inspect --db <path> --uarch <uarch_name> [--max-teams N]
-
-    # Train a Lasso regression model for a specific uarch (80/20 split)
     python main.py train --db <path> --uarch <uarch_name> [--test-size 0.2] [--seed 42]
 """
 
@@ -26,6 +17,7 @@ import sys
 
 from classes.database import Database
 from classes.loader import Loader
+from analysis.analyzer import FeaturesAnalyzer
 from analysis.regression import Regressor
 
 
@@ -48,24 +40,36 @@ def cmd_summary(args: argparse.Namespace) -> None:
     db.print_summary()
 
 
+def _compute_features(db: Database, uarch_name: str) -> None:
+    """Compute feature vectors for all CompiledTeams targeting uarch_name."""
+    # get_compiled_teams_for_uarch now returns (tpg, team_id, ct) triples.
+    for _tpg, team_id, ct in db.get_compiled_teams_for_uarch(uarch_name):
+        ct.feature_vector = FeaturesAnalyzer.analyze_instructions(
+            ct.instructions, id_team=team_id
+        )
+
+
 def cmd_inspect(args: argparse.Namespace) -> None:
     db = Database.load(args.db)
+    _compute_features(db, args.uarch)
     db.print_uarch(args.uarch, max_teams=args.max_teams)
 
 
 def cmd_train(args: argparse.Namespace) -> None:
     db = Database.load(args.db)
 
-    teams = db.get_teams_for_uarch(args.uarch)
-    if len(teams) < 2:
-        print(f"[train] Need at least 2 teams for {args.uarch!r}, found {len(teams)}")
+    triples = db.get_compiled_teams_for_uarch(args.uarch)
+    if len(triples) < 2:
+        print(f"[train] Need at least 2 compiled teams for {args.uarch!r}, "
+              f"found {len(triples)}")
         sys.exit(1)
 
-    feature_vectors = [t.feature_vector for t in teams if t.feature_vector]
-    latencies = [
-        next(m.latency for m in t.measurements if m.uarch.name == args.uarch)
-        for t in teams if t.feature_vector
-    ]
+    # ── Feature extraction — done here so rules can be freely changed ──
+    _compute_features(db, args.uarch)
+
+    # ── Build training data ────────────────────────────────────────────
+    feature_vectors = [ct.feature_vector for _tpg, _tid, ct in triples]
+    latencies       = [ct.measurement.latency for _tpg, _tid, ct in triples]
 
     print(f"[train] {len(feature_vectors)} samples  uarch={args.uarch!r}")
     model = Regressor.train(
@@ -84,25 +88,21 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # ── load ──────────────────────────────────────────────────────────────
     p_load = sub.add_parser("load", help="Ingest a model folder into the database")
     p_load.add_argument("root", help="Model root directory to scan")
     p_load.add_argument("--db",   default=None, help="Existing database to extend")
     p_load.add_argument("--save", default=None,
                         help="Where to save the updated database (defaults to --db)")
 
-    # ── summary ───────────────────────────────────────────────────────────
     p_sum = sub.add_parser("summary", help="Print database summary")
     p_sum.add_argument("--db", required=True, help="Database file")
 
-    # ── inspect ───────────────────────────────────────────────────────────
-    p_ins = sub.add_parser("inspect", help="Print all teams for a given uarch")
+    p_ins = sub.add_parser("inspect", help="Print all compiled teams for a given uarch")
     p_ins.add_argument("--db",        required=True, help="Database file")
     p_ins.add_argument("--uarch",     required=True, help="Uarch name (simulator field)")
     p_ins.add_argument("--max-teams", type=int, default=None,
                        help="Limit number of teams printed")
 
-    # ── train ─────────────────────────────────────────────────────────────
     p_tr = sub.add_parser("train", help="Train a Lasso model for one uarch")
     p_tr.add_argument("--db",        required=True, help="Database file")
     p_tr.add_argument("--uarch",     required=True, help="Uarch name to train on")

@@ -10,12 +10,9 @@ LassoCV is used instead of plain LinearRegression for two reasons:
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-
-
 from classes.features import FeatureVector
-
+from sklearn.preprocessing import StandardScaler
 
 @dataclass
 class TrainTestSplit:
@@ -146,7 +143,7 @@ class Regressor:
         features:     list[FeatureVector],
         latencies:    list[float],
         test_size:    float = 0.20,
-        random_state: int   = 42,
+        random_state: int   = 0, #42
         cv:           int   = 5,
     ) -> RegressionModel:
         """
@@ -220,11 +217,35 @@ class Regressor:
             )
             actual_test_size = len(y_test)
 
+        
         n_train, n_test = len(y_train), actual_test_size
 
+        nonzero_counts = (X_train != 0).sum(axis=0)
+        keep_mask = nonzero_counts >= 15
+        all_keys = [k for k, keep in zip(all_keys, keep_mask) if keep]
+        X_train = X_train[:, keep_mask]
+        X_test = X_test[:, keep_mask]   
+
+        # Apply standard scaling
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)   # computes mean/std from training rows
+        X_test = scaler.transform(X_test)          # reuses those same stats, doesn't refit
+
         # ── Fit LassoCV on training fold only ────────────────────────────
-        lasso = LassoCV(cv=min(cv, n_train), max_iter=10_000, random_state=random_state)
+        lasso = LassoCV(cv=min(cv, n_train), max_iter=10_000, random_state=random_state, positive=True)
+        from sklearn.linear_model import ElasticNetCV
+
+        #lasso = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=10_000, positive=True, random_state=42)
+
         lasso.fit(X_train, y_train)
+
+        #debug
+        print("alpha_max (grid top):", lasso.alphas_[0])
+        print("alpha_min (grid bottom):", lasso.alphas_[-1])
+        print("n_alphas in grid:", len(lasso.alphas_))
+        print("chosen alpha:", lasso.alpha_)
+        #print("chosen l1_ratio:", lasso.l1_ratio_)
+
 
         weights = {
             name: float(coef)

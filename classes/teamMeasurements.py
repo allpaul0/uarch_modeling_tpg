@@ -1,39 +1,35 @@
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .uarch import Uarch
 
 
 @dataclass
 class TeamMeasurement:
     """
-    A single measured latency for a Team running on a given Uarch.
+    Latency statistics for one CompiledTeam running on its target Uarch.
+
+    The uarch reference and team identity are held by the owning CompiledTeam,
+    so they are not repeated here.
 
     Attributes
     ----------
-    uarch:           Micro-architecture the measurement was taken on.
-    id_team:         Team identifier.
     latency:         Average cycle count over all runs (AvgCyclesPerTeam).
-    nb_measurements: Number of individual runs that produced this average
-                     (Count in the JSON results file).
-    stddev:          Standard deviation of the cycle count across runs
-                     (StddevCyclesPerTeam).
-    cv:              Coefficient of variation (StddevCyclesPerTeam /
-                     AvgCyclesPerTeam × 100), expressed as a percentage.
+    nb_measurements: Number of individual runs that produced this average.
+    stddev:          Standard deviation of the cycle count across runs.
     """
-    uarch: "Uarch"
-    id_team: int
     latency: float
     nb_measurements: int = 0
     stddev: float = 0.0
-    cv: float = 0.0
+
+    @property
+    def cv(self) -> float:
+        """Coefficient of variation (derived, not stored)."""
+        if self.latency == 0.0:
+            return 0.0
+        return (self.stddev / self.latency) * 100.0
 
     def __repr__(self) -> str:
         return (
-            f"TeamMeasurement(id_team={self.id_team}, "
-            f"uarch={self.uarch.name!r}, "
-            f"latency={self.latency:.2f}, "
-            f"nb_measurements={self.nb_measurements}, "
-            f"stddev={self.stddev:.2f}, cv={self.cv:.4f})"
+            f"TeamMeasurement(latency={self.latency:.2f}, "
+            f"stddev={self.stddev:.2f}, "
+            f"nb_measurements={self.nb_measurements})"
         )

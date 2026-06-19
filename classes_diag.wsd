@@ -12,9 +12,10 @@ class TPG {
 
 class Team {
     + id : Integer
+}
+
+class CompiledTeam {
     + code : String
-    + nbTeamMeasurements : Integer
-    ' + idProgs : List<Integer>
 }
 
 class Instruction {
@@ -22,8 +23,8 @@ class Instruction {
     + operands : List<String>
 }
 
-TPG "1" *-- "1..*" Team
-Team "1" *-- "1..*" Instruction
+TPG "1" *-- "1..*" Team : contains
+Team "1" *-- "1..*" CompiledTeam : compiled as
 
 ' =====================================
 ' MICROARCHITECTURE
@@ -35,6 +36,8 @@ class Uarch {
     + abi : String
 }
 
+CompiledTeam "1..*" --> "1" Uarch : targets
+
 ' =====================================
 ' MEASURED PERFORMANCE
 ' =====================================
@@ -42,34 +45,33 @@ class Uarch {
 class TeamMeasurement {
     + latencyAvg : Float
     + latencyStdDev : Float
-    + count : int
+    + count : Integer
 }
 
-Team "1" *-- "0..*" TeamMeasurement
-Uarch "1" *-- "0..*" TeamMeasurement
-Team "1" *-- "1" FeatureVector
+CompiledTeam "1" *-- "1" TeamMeasurement
 
 ' =====================================
 ' FEATURE EXTRACTION
 ' =====================================
 
 class FeatureVector {
-    ' Created from instructions, table of features 
-    ' {"ADD_count": 3, "LOAD_count": 5, "RAW_hazards": 2, "ADD_ADD_transition": 1}
     + values : Map<String, Float>
 }
 
+CompiledTeam "1" *-- "1..*" Instruction
+CompiledTeam "1" *-- "1" FeatureVector
+
 class Disassembler {
-    + parseAssembly(code : String) : List<Instruction>
+    + parseTpgFile(path : String) : Map<TeamId, TeamBlock>
+    + parseLatencyJson(path : String) : TPGLatencyData
 }
 
 class FeaturesAnalyzer {
     + analyzeInstructions(instructions : List<Instruction>) : FeatureVector
 }
 
-Disassembler ..> Team : parses
+Disassembler ..> CompiledTeam : parses
 Disassembler ..> Instruction : produces
-
 FeaturesAnalyzer ..> Instruction : analyzes
 FeaturesAnalyzer ..> FeatureVector : produces
 
@@ -78,7 +80,6 @@ FeaturesAnalyzer ..> FeatureVector : produces
 ' =====================================
 
 class RegressionModel {
-    ' weights = { "ADD_count": 0.12, "LOAD_count": 1.85, "RAW_hazards": 3.40, "ADD_ADD_transition": 0.75'
     + weights : Map<String, Float>
     + bias : Float
 }
@@ -88,7 +89,7 @@ class Regressor {
     + predict(features : FeatureVector) : Float
 }
 
-Regressor ..> RegressionModel : produces model
+Regressor ..> RegressionModel : produces
 Regressor ..> FeatureVector : takes training data
 Regressor ..> TeamMeasurement : takes latency labels
 

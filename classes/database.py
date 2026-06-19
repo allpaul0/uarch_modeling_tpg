@@ -1,25 +1,18 @@
 """
 classes/database.py — central Database that owns all Uarchs and TPGs.
-
-The Database is the single source of truth.  It is:
-  - serialisable / deserialisable via pickle  (preserves the full object graph)
-  - queryable by uarch or by (tpg, team)
-  - deduplication-aware: loading the same TPG/uarch data twice is a no-op
 """
 
 from __future__ import annotations
 
 import pickle
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .tpg import TPG
-    from .team import Team
+    from .team import Team, CompiledTeam
     from .uarch import Uarch
-    from .teamMeasurements import TeamMeasurement
 
 
 @dataclass
@@ -30,96 +23,81 @@ class Database:
     Structure
     ---------
     uarchs : dict[str, Uarch]
-        Keyed by ``Uarch.name`` (= simulator field from the JSON, e.g.
-        ``"cv32e40x_im2_zba_zbb"``).  One Uarch object per distinct
-        micro-architecture; it aggregates *all* TeamMeasurements taken on it.
+        Registry of known Uarch objects, keyed by uarch name.  Ensures all
+        CompiledTeams targeting the same uarch share one Uarch instance.
 
     tpgs : dict[str, TPG]
-        Keyed by TPG name (= seed-directory basename).  Each TPG owns its
-        Teams.  Teams hold their Instructions, FeatureVector, and the list of
-        TeamMeasurements that link them back to specific Uarchs.
+        Keyed by TPG.source_path (absolute path of the seed directory).
+        Using the full path — not the basename — guarantees uniqueness even
+        when loading from multiple roots or when seeds share a basename.
 
     loaded_keys : set[str]
-        Tracks ``"<tpg_name>|<uarch_name>"`` strings for every (TPG, Uarch)
-        pair that has already been ingested.  Used by the deduplication check
-        so that re-loading the same results folder is a no-op.
+        Deduplication guard.  Tracks "<source_path>|<uarch_name>" pairs
+        that have already been ingested so re-loading is a no-op.
     """
 
-    uarchs: dict[str, "Uarch"] = field(default_factory=dict)
-    tpgs:   dict[str, "TPG"]   = field(default_factory=dict)
-    loaded_keys: set[str]      = field(default_factory=set)
+    uarchs:      dict[str, "Uarch"] = field(default_factory=dict)
+    tpgs:        dict[str, "TPG"]   = field(default_factory=dict)  # key = source_path
+    loaded_keys: set[str]           = field(default_factory=set)
 
     # ------------------------------------------------------------------ #
     # Insertion helpers
     # ------------------------------------------------------------------ #
 
     def get_or_create_uarch(self, name: str, isa: str, abi: str) -> "Uarch":
-        """Return the existing Uarch or create and register a new one."""
         from .uarch import Uarch
         if name not in self.uarchs:
             self.uarchs[name] = Uarch(name=name, isa=isa, abi=abi)
         return self.uarchs[name]
 
-    def get_or_create_tpg(self, name: str, dtype: str) -> "TPG":
-        """Return the existing TPG or create and register a new one."""
+    def get_or_create_tpg(
+        self,
+        source_path: str,   # unique key — absolute path of seed dir
+        name: str,          # display name — seed-dir basename
+        dtype: str,
+    ) -> "TPG":
         from .tpg import TPG
-        if name not in self.tpgs:
-            self.tpgs[name] = TPG(name=name, dtype=dtype)
-        return self.tpgs[name]
+        if source_path not in self.tpgs:
+            self.tpgs[source_path] = TPG(
+                source_path=source_path,
+                name=name,
+                dtype=dtype,
+            )
+        return self.tpgs[source_path]
 
-    def is_loaded(self, tpg_name: str, uarch_name: str) -> bool:
-        """Return True if this (tpg, uarch) pair is already in the database."""
-        return f"{tpg_name}|{uarch_name}" in self.loaded_keys
+    def is_loaded(self, source_path: str, uarch_name: str) -> bool:
+        return f"{source_path}|{uarch_name}" in self.loaded_keys
 
-    def mark_loaded(self, tpg_name: str, uarch_name: str) -> None:
-        """Record that this (tpg, uarch) pair has been ingested."""
-        self.loaded_keys.add(f"{tpg_name}|{uarch_name}")
+    def mark_loaded(self, source_path: str, uarch_name: str) -> None:
+        self.loaded_keys.add(f"{source_path}|{uarch_name}")
 
     # ------------------------------------------------------------------ #
     # Queries
     # ------------------------------------------------------------------ #
 
-    def get_teams_for_uarch(self, uarch_name: str) -> list["Team"]:
+    def get_compiled_teams_for_uarch(
+        self, uarch_name: str
+    ) -> list[tuple["TPG", int, "CompiledTeam"]]:
         """
-        Return all Teams across all TPGs that have at least one measurement
-        on the given Uarch.
+        Return all (tpg, team_id, CompiledTeam) triples across all TPGs for
+        the given uarch.
+
+        The TPG is included so callers can unambiguously identify which TPG
+        each team belongs to (team IDs are only unique within a TPG).
         """
-        result: list["Team"] = []
+        result: list[tuple["TPG", int, "CompiledTeam"]] = []
         for tpg in self.tpgs.values():
             for team in tpg.teams:
-                if any(m.uarch.name == uarch_name for m in team.measurements):
-                    result.append(team)
+                ct = team.get_compiled_for_uarch(uarch_name)
+                if ct is not None:
+                    result.append((tpg, team.id, ct))
         return result
-
-    def get_measurement(
-        self, tpg_name: str, team_id: int, uarch_name: str
-    ) -> "TeamMeasurement | None":
-        """Return the specific measurement for a (tpg, team, uarch) triple."""
-        tpg = self.tpgs.get(tpg_name)
-        if tpg is None:
-            return None
-        team = tpg.get_team(team_id)
-        if team is None:
-            return None
-        for m in team.measurements:
-            if m.uarch.name == uarch_name:
-                return m
-        return None
 
     # ------------------------------------------------------------------ #
     # Persistence
     # ------------------------------------------------------------------ #
 
     def save(self, path: str | Path) -> None:
-        """
-        Serialise the entire Database to a pickle file.
-
-        The full object graph (cross-references between Teams,
-        TeamMeasurements, and Uarchs) is preserved by pickle.
-
-        Args:
-            path: Destination file path (conventionally ``*.pkl``).
-        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as fh:
@@ -129,18 +107,6 @@ class Database:
 
     @staticmethod
     def load(path: str | Path) -> "Database":
-        """
-        Deserialise a Database from a pickle file.
-
-        Args:
-            path: Path to a file previously written by :meth:`save`.
-
-        Returns:
-            The restored Database instance.
-
-        Raises:
-            FileNotFoundError: If *path* does not exist.
-        """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Database file not found: {path}")
@@ -154,28 +120,39 @@ class Database:
     # Pretty-printing
     # ------------------------------------------------------------------ #
 
+    def _count_compiled_teams_for_uarch(self, uarch_name: str) -> int:
+        return sum(
+            1
+            for tpg in self.tpgs.values()
+            for team in tpg.teams
+            for ct in team.compiled_teams
+            if ct.uarch.name == uarch_name
+        )
+
     def print_summary(self) -> None:
-        """Print a high-level overview: uarchs, TPGs, and team counts."""
-        total_teams    = sum(len(tpg.teams) for tpg in self.tpgs.values())
+        total_teams = sum(len(tpg.teams) for tpg in self.tpgs.values())
 
         print("\n" + "═" * 70)
         print(f"  DATABASE SUMMARY  —  {len(self.tpgs)} TPGs  ·  {len(self.uarchs)} Uarchs")
-        print(f"  Teams: {total_teams} total")
+        print(f"  ·  Teams (unique): {total_teams}")
         print("═" * 70)
 
         print("\n  Uarchs:")
         for uarch in self.uarchs.values():
+            n = self._count_compiled_teams_for_uarch(uarch.name)
             print(f"    {uarch.name}  isa={uarch.isa}  abi={uarch.abi}"
-                  f"  ({len(uarch.measurements)} measurements)")
+                  f"  ({n} compiled teams)")
 
         print(f"\n  TPGs ({len(self.tpgs)}):")
         for tpg in self.tpgs.values():
             uarch_names = sorted({
-                m.uarch.name
+                ct.uarch.name
                 for team in tpg.teams
-                for m in team.measurements
+                for ct in team.compiled_teams
             })
+            # Display the human-readable name; source_path shown for traceability
             print(f"    {tpg.name}")
+            print(f"      path={tpg.source_path}")
             print(f"      dtype={tpg.dtype}"
                   f"  teams={len(tpg.teams)}"
                   f"  uarchs={uarch_names}")
@@ -183,47 +160,41 @@ class Database:
 
     def print_uarch(self, uarch_name: str, max_teams: int | None = None) -> None:
         """
-        Print every Team that has a measurement on *uarch_name*, showing its
-        instructions, latency, and feature vector.
-
-        Args:
-            uarch_name: Key in ``self.uarchs`` (simulator name).
-            max_teams:  Cap the number of teams printed.  None = all.
+        Print every CompiledTeam targeting uarch_name: code, instructions,
+        latency, and feature vector (if already computed).
         """
         uarch = self.uarchs.get(uarch_name)
         if uarch is None:
             print(f"[Database] Unknown uarch: {uarch_name!r}")
             return
 
-        teams = self.get_teams_for_uarch(uarch_name)
+        triples = self.get_compiled_teams_for_uarch(uarch_name)
         if max_teams is not None:
-            teams = teams[:max_teams]
+            triples = triples[:max_teams]
 
         bar = "─" * 70
         print(f"\n{'═'*70}")
         print(f"  UARCH: {uarch.name}  |  ISA: {uarch.isa}  |  ABI: {uarch.abi}")
-        print(f"  Showing {len(teams)} team(s) with measurements on this uarch")
+        print(f"  Showing {len(triples)} compiled team(s)")
         print(f"{'═'*70}")
 
-        for team in teams:
-            meas = next(m for m in team.measurements if m.uarch.name == uarch_name)
-            # Find which TPG owns this team
-            tpg_name = next(
-                (tpg.name for tpg in self.tpgs.values()
-                 if any(t.id == team.id for t in tpg.teams)),
-                "?"
-            )
+        for tpg, team_id, ct in triples:
+            # tpg is the direct owner — no search needed, no misidentification
+            meas = ct.measurement
             print(f"\n{bar}")
-            print(f"  Team {team.id}  |  TPG: {tpg_name}")
-            print(f"  Latency : {meas.latency:.2f} cycles"
-                  f"  stddev={meas.stddev:.2f}"
-                  f"  nb_measurements={meas.nb_measurements}")
-            print(f"  Instructions ({len(team.instructions)}):")
-            for instr in team.instructions:
+            print(f"  Team {team_id}  |  TPG: {tpg.name}  |  path: {tpg.source_path}")
+            if meas:
+                print(f"  Latency : {meas.latency:.2f} cycles"
+                      f"  stddev={meas.stddev:.2f}"
+                      f"  nb_measurements={meas.nb_measurements}")
+            print(f"  asm:")
+            print(ct.code)
+            print(f"\n  Instructions ({len(ct.instructions)}):")
+            for instr in ct.instructions:
                 print(f"    {instr.mnemonic:<12} {' '.join(instr.operands)}")
-            if team.feature_vector and team.feature_vector.values:
-                fv = team.feature_vector
-                # Show only non-zero features, sorted by value desc
+
+            if ct.feature_vector and ct.feature_vector.values:
+                fv = ct.feature_vector
                 non_zero = sorted(
                     ((k, v) for k, v in fv.values.items() if v != 0.0),
                     key=lambda kv: -kv[1],
@@ -233,4 +204,6 @@ class Database:
                     print(f"    {k:<35} {v:.1f}")
                 if len(non_zero) > 15:
                     print(f"    … ({len(non_zero) - 15} more)")
+            else:
+                print(f"  FeatureVector: not yet computed")
         print(bar)

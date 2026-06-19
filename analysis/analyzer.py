@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from collections import Counter
 
 from classes.instruction import Instruction
@@ -13,6 +14,9 @@ from classes.features import FeatureVector
 _MEM_STORES = {"sw", "sh", "sb"}
 _BRANCHES   = {"beq", "bne", "blt", "bge", "bltu", "bgeu"}
 _JUMPS      = {"jal", "jalr"}
+
+# Maximum look-back distance considered when searching for RAW hazards.
+_RAW_MAX_DISTANCE = 1#3
 
 
 class FeaturesAnalyzer:
@@ -30,10 +34,18 @@ class FeaturesAnalyzer:
         any linear model including Lasso.  total_instructions is likewise the
         sum of all per-mnemonic counts and is excluded for the same reason.
 
-    RAW hazard estimate  → "raw_hazards"
-        Count of Read-After-Write hazards within a 2-instruction look-back
-        window.  This is a derived structural feature not expressible as a
-        linear combination of mnemonic counts, so it is kept.
+    RAW hazards          → "raw_d<N>_<PRODUCER>_<CONSUMER>_count"
+        Count of Read-After-Write hazards, broken down by:
+          - look-back distance N (1, 2 or 3 instructions apart), and
+          - the (producer mnemonic, consumer mnemonic) pair involved.
+        A distance-1 hazard between e.g. "lw" and "add" is tracked
+        separately from a distance-1 hazard between "lw" and "sub", and
+        separately again from a distance-2 hazard between the same two
+        mnemonics — these correspond to different pipeline stall/forwarding
+        situations and are not interchangeable signals.  No aggregate
+        "raw_hazards" total is emitted, for the same multicollinearity
+        reason per-mnemonic counts replace total_instructions: the total
+        would be an exact sum of these finer-grained features.
 
     Bigram transitions   → "<A>_<B>_transition"
         Counts of consecutive mnemonic pairs.  These capture instruction-
@@ -74,12 +86,17 @@ class FeaturesAnalyzer:
         for mnem, cnt in mnem_counts.items():
             values[f"{mnem}_count"] = float(cnt)
 
-        # -- RAW hazard estimate ------------------------------------------
-        values["raw_hazards"] = float(FeaturesAnalyzer._count_raw_hazards(instructions))
+        # -- RAW hazards, split by distance and producer/consumer pair ----
+        raw_counts = FeaturesAnalyzer._raw_hazard_counts(instructions)
+        for (distance, producer, consumer), cnt in raw_counts.items():
+            values[f"raw_d{distance}_{producer}_{consumer}_count"] = float(cnt)
 
         # -- Bigram transitions -------------------------------------------
-        for (a, b), cnt in FeaturesAnalyzer._bigram_counts(mnemonics).items():
-            values[f"{a}_{b}_transition"] = float(cnt)
+        #for (a, b), cnt in FeaturesAnalyzer._bigram_counts(mnemonics).items():
+        #    values[f"{a}_{b}_transition"] = float(cnt)
+
+        # -- Length of instructions ---------------------------------------
+        values["BB_length"] = len(instructions)
 
         return FeatureVector(id_team=id_team, values=values)
 
@@ -107,7 +124,6 @@ class FeaturesAnalyzer:
         Return the set of registers *read* by instr.
         Strips memory-offset syntax like '-8(sp)' → 'sp'.
         """
-        import re
         used: set[str] = set()
         for op in instr.operands[1:]:          # operands[0] is typically dest
             m = re.fullmatch(r"-?\d+\((\w+)\)", op)
@@ -118,23 +134,64 @@ class FeaturesAnalyzer:
         return used
 
     @staticmethod
-    def _count_raw_hazards(instructions: list[Instruction]) -> int:
+    def _raw_hazard_counts(
+        instructions: list[Instruction],
+        max_distance: int = _RAW_MAX_DISTANCE,
+    ) -> Counter:
         """
-        Count Read-After-Write (RAW) hazards within a window of 3 instructions.
-        A RAW hazard occurs when an instruction reads a register written by
-        one of its 2 immediate predecessors.
+        Count Read-After-Write (RAW) hazards, keyed by
+        (distance, producer_mnemonic, consumer_mnemonic).
+
+        For every instruction (the "consumer") we look back up to
+        `max_distance` predecessors. For each look-back distance d in
+        1..max_distance, the predecessor at that exact distance (the
+        "producer") is checked independently: if it writes a register the
+        consumer reads, that's one hazard recorded under
+        (d, producer.mnemonic, consumer.mnemonic).
+
+        Distances are evaluated independently of one another (no "stop at
+        the first hit" short-circuit), because a distance-1 hazard and a
+        distance-2 hazard for the same consumer are different signals — a
+        non-forwarding pipeline stalls differently depending on how far
+        back the conflicting write happened, and the identity of the
+        producer/consumer pair changes which forwarding path would apply.
+        At most one hazard is still recorded per (distance, consumer)
+        pair: if a producer at that exact distance defines several of the
+        registers the consumer reads, that is one structural hazard, not
+        several.
+
+        Args:
+            instructions: Instructions belonging to one basic block / team.
+            max_distance: Largest look-back distance to consider (default 3).
+
+        Returns:
+            Counter mapping (distance, producer_mnemonic, consumer_mnemonic)
+            to the number of times that exact hazard pattern occurred.
         """
-        hazards = 0
-        window = 2  # look-back distance
+        counts: Counter = Counter()
 
         for idx in range(1, len(instructions)):
-            uses = FeaturesAnalyzer._used_registers(instructions[idx])
-            for prev in range(max(0, idx - window), idx):
-                defs = FeaturesAnalyzer._defined_registers(instructions[prev])
+            consumer = instructions[idx]
+            uses = FeaturesAnalyzer._used_registers(consumer)
+            if not uses:
+                continue
+
+            for distance in range(1, max_distance + 1):
+                prev_idx = idx - distance
+                if prev_idx < 0:
+                    break
+
+                producer = instructions[prev_idx]
+                defs = FeaturesAnalyzer._defined_registers(producer)
                 if uses & defs:
-                    hazards += 1
-                    break  # count at most one hazard per instruction
-        return hazards
+                    key = (
+                        distance,
+                        producer.mnemonic.lower(),
+                        consumer.mnemonic.lower(),
+                    )
+                    counts[key] += 1
+
+        return counts
 
     @staticmethod
     def _bigram_counts(mnemonics: list[str]) -> Counter:
