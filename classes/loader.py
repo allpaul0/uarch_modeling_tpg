@@ -37,11 +37,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from .database import Database
-from .tpg import TPG
+from .tpg import TPG, ClassLatencyPair
 from .team import Team, CompiledTeam
 from .teamMeasurements import TeamMeasurement
 from .uarch import Uarch
 from analysis.disassembler import Disassembler, TeamBlock, TPGLatencyData
+from analysis.traversal import TraversalAnalyzer
 
 _DISASM_FILENAME = "disassembly_tpg_inference_instrTeams_instrTPG.txt"
 
@@ -173,6 +174,33 @@ class Loader:
             name=display_name,         # display only
             dtype=lat_data.dtype,
         )
+
+        # ── Graph traversals (LE_states.h) ─────────────────────────────
+        # Parsed once per TPG; the mapping is ISA/uarch-independent.  It
+        # lives at <seed_dir>/outLogs/precalcul/LE_states.h.
+        if not tpg.traversals:
+            le_path = TraversalAnalyzer.le_states_path_for(source_path)
+            tpg.traversals = TraversalAnalyzer.parse_le_states(le_path)
+            if tpg.traversals:
+                print(f"[Loader]   parsed {len(tpg.traversals)} traversal(s) "
+                      f"from LE_states.h")
+            else:
+                print(f"[Loader]   note: no LE_states.h traversal map found "
+                      f"under {le_path.parent}")
+
+        # ── Whole-TPG class latencies for both instrumentation modes ───
+        tpg.class_latencies[uarch_name] = {
+            cid: ClassLatencyPair(
+                class_id=cid,
+                tpg_only=lat_data.classes_tpg_only.get(cid).avg_cycles
+                    if lat_data.classes_tpg_only.get(cid) else 0.0,
+                tpg_teams=teams_cl.avg_cycles,
+                tpg_only_stddev=lat_data.classes_tpg_only.get(cid).stddev_cycles
+                    if lat_data.classes_tpg_only.get(cid) else 0.0,
+                tpg_teams_stddev=teams_cl.stddev_cycles,
+            )
+            for cid, teams_cl in lat_data.classes_tpg_teams.items()
+        }
 
         added = skipped_no_lat = 0
 

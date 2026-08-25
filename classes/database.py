@@ -158,6 +158,11 @@ class Database:
                   f"  uarchs={uarch_names}")
         print("═" * 70)
 
+        # Traversal / instrumentation-overcost section (own class).
+        # Local import keeps the classes↔analysis dependency lazy.
+        from analysis.traversal import TraversalAnalyzer
+        TraversalAnalyzer.print_summary(self)
+
     def print_uarch(self, uarch_name: str, max_teams: int | None = None) -> None:
         """
         Print every CompiledTeam targeting uarch_name: code, instructions,

@@ -94,7 +94,7 @@ class FeaturesAnalyzer:
         #    values[f"{a}_{b}_transition"] = float(cnt)
 
         # -- Length of instructions ---------------------------------------
-        values["BB_length"] = len(instructions)
+        #values["BB_length"] = len(instructions)
 
         return FeatureVector(values=values)
 

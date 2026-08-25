@@ -89,21 +89,60 @@ class TeamLatency:
 
 
 @dataclass
+class ClassLatency:
+    """
+    Whole-TPG latency for one *class* (a.k.a. graph traversal / learning
+    example class) reported in a JSON "Classes" array.
+
+    A class corresponds to one path through the TPG — the same integer id
+    used by the ``[k] -> [T.. -> T..]`` mapping in ``LE_states.h``.
+
+    Attributes
+    ----------
+    class_id:              The "Class" field (== traversal id in LE_states.h).
+    nb_measurements:       "Count" — number of individual runs averaged.
+    avg_cycles:            "AvgCyclesPerClass".
+    stddev_cycles:         "StddevCyclesPerClass".
+    coefficient_variation: "CoefficientVariation".
+    """
+    class_id: int
+    nb_measurements: int
+    avg_cycles: float
+    stddev_cycles: float
+    coefficient_variation: float
+
+
+@dataclass
 class TPGLatencyData:
     """
     All latency information parsed from one JSON results file.
 
+    The JSON contains two whole-TPG benchmarks:
+
+      * ``instrTPG``            — only the TPG is instrumented.
+      * ``instrTeams_instrTPG`` — the TPG *and* every team are instrumented;
+                                  the extra per-team timing probes add an
+                                  instrumentation *overcost* on top of the
+                                  ``instrTPG`` figure.
+
+    Both are captured per class so the overcost can be quantified traversal
+    by traversal.  Per-team latencies come from the ``Teams`` array of the
+    ``instrTeams_instrTPG`` section (teams are only measurable when they are
+    instrumented).
+
     Attributes
     ----------
-    simulator:      Simulator / uarch name  (e.g. "cv32e40x_im2_zba_zbb").
-    isa:            ISA string              (e.g. "rv32ic_zicsr_zmmul_zba_zbb").
-    abi:            ABI string              (e.g. "ilp32").
-    dtype:          Data type               (e.g. "fixedpt").
-    tpg_mean_lat:   Mean latency of the whole TPG (cycles).
-    tpg_stddev_lat: Stddev of the whole-TPG latency (cycles).
-    team_latencies: Dict mapping team_id → TeamLatency.  Only teams that
-                    appear in the JSON "Teams" array are present; zero-
-                    latency teams are absent.
+    simulator:          Simulator / uarch name  (e.g. "cv32e40x_im2_zba_zbb").
+    isa:                ISA string              (e.g. "rv32ic_zicsr_zmmul_zba_zbb").
+    abi:                ABI string              (e.g. "ilp32").
+    dtype:              Data type               (e.g. "fixedpt").
+    tpg_mean_lat:       Mean whole-TPG latency, teams+TPG instrumented (cycles).
+    tpg_stddev_lat:     Stddev of the above.
+    tpg_only_mean_lat:  Mean whole-TPG latency, TPG-only instrumented (cycles).
+    tpg_only_stddev_lat:Stddev of the above.
+    team_latencies:     Dict team_id → TeamLatency (instrTeams_instrTPG.Teams).
+    classes_tpg_only:   Dict class_id → ClassLatency from ``instrTPG``.
+    classes_tpg_teams:  Dict class_id → ClassLatency from ``instrTeams_instrTPG``.
     """
     simulator: str
     isa: str
@@ -112,6 +151,10 @@ class TPGLatencyData:
     tpg_mean_lat: float
     tpg_stddev_lat: float
     team_latencies: dict[int, TeamLatency] = field(default_factory=dict)
+    tpg_only_mean_lat: float = 0.0
+    tpg_only_stddev_lat: float = 0.0
+    classes_tpg_only:  dict[int, ClassLatency] = field(default_factory=dict)
+    classes_tpg_teams: dict[int, ClassLatency] = field(default_factory=dict)
 
     def get_team_latency(self, team_id: int) -> TeamLatency | None:
         """Return the TeamLatency for *team_id*, or None if not measured."""
@@ -228,9 +271,10 @@ class Disassembler:
         with open(path, "r") as fh:
             data: dict = json.load(fh)
 
-        section = data["instrTeams_instrTPG"]
-        team_latencies: dict[int, TeamLatency] = {}
+        section = data["instrTeams_instrTPG"]          # TPG + teams instrumented
+        tpg_only_section = data.get("instrTPG", {})    # TPG-only instrumented
 
+        team_latencies: dict[int, TeamLatency] = {}
         for entry in section.get("Teams", []):
             tid = int(entry["Team"])
             team_latencies[tid] = TeamLatency(
@@ -241,6 +285,19 @@ class Disassembler:
                 coefficient_variation=float(entry["CoefficientVariation"]),
             )
 
+        def _parse_classes(sec: dict) -> dict[int, ClassLatency]:
+            out: dict[int, ClassLatency] = {}
+            for entry in sec.get("Classes", []):
+                cid = int(entry["Class"])
+                out[cid] = ClassLatency(
+                    class_id=cid,
+                    nb_measurements=int(entry["Count"]),
+                    avg_cycles=float(entry["AvgCyclesPerClass"]),
+                    stddev_cycles=float(entry["StddevCyclesPerClass"]),
+                    coefficient_variation=float(entry["CoefficientVariation"]),
+                )
+            return out
+
         return TPGLatencyData(
             simulator=data["simulator"],
             isa=data["isa"],
@@ -249,6 +306,10 @@ class Disassembler:
             tpg_mean_lat=float(section["tpg_mean_lat"]),
             tpg_stddev_lat=float(section["tpg_stddev_lat"]),
             team_latencies=team_latencies,
+            tpg_only_mean_lat=float(tpg_only_section.get("tpg_mean_lat", 0.0)),
+            tpg_only_stddev_lat=float(tpg_only_section.get("tpg_stddev_lat", 0.0)),
+            classes_tpg_only=_parse_classes(tpg_only_section),
+            classes_tpg_teams=_parse_classes(section),
         )
 
     # ------------------------------------------------------------------ #

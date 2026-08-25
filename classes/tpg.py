@@ -5,6 +5,39 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .team import Team
 
+
+@dataclass
+class ClassLatencyPair:
+    """
+    Whole-TPG latency for one class / graph traversal under the two
+    instrumentation modes measured in ``latencies.json``.
+
+    Attributes
+    ----------
+    class_id:   Traversal id (matches the ``[k] ->`` mapping in LE_states.h
+                and the "Class" field in the JSON).
+    tpg_only:   AvgCyclesPerClass from ``instrTPG`` (only the TPG instrumented).
+    tpg_teams:  AvgCyclesPerClass from ``instrTeams_instrTPG`` (TPG *and* teams
+                instrumented — carries the per-team probe overcost).
+    tpg_only_stddev / tpg_teams_stddev: matching StddevCyclesPerClass values.
+    """
+    class_id: int
+    tpg_only: float
+    tpg_teams: float
+    tpg_only_stddev: float = 0.0
+    tpg_teams_stddev: float = 0.0
+
+    @property
+    def overcost(self) -> float:
+        """Absolute instrumentation overcost (cycles) of measuring teams."""
+        return self.tpg_teams - self.tpg_only
+
+    @property
+    def overcost_pct(self) -> float:
+        """Overcost as a percentage of the TPG-only latency."""
+        return (self.overcost / self.tpg_only * 100.0) if self.tpg_only else 0.0
+
+
 @dataclass
 class TPG:
     """
@@ -29,6 +62,19 @@ class TPG:
     dtype: str
     gpis: list[str] = field(default_factory=list)
     teams: list["Team"] = field(default_factory=list)
+
+    # Graph traversals parsed from outLogs/precalcul/LE_states.h.
+    # Maps traversal/class id -> ordered list of team ids visited.
+    # ISA/uarch-independent (it describes graph structure), so it lives on
+    # the TPG rather than per-compilation.
+    traversals: dict[int, list[int]] = field(default_factory=dict)
+
+    # Per-uarch whole-TPG class latencies (both instrumentation modes).
+    # Keyed by uarch name, then by class/traversal id.  Populated at load
+    # time from each uarch's latencies.json.
+    class_latencies: dict[str, dict[int, "ClassLatencyPair"]] = field(
+        default_factory=dict
+    )
 
     def add_team(self, team: "Team") -> None:
         self.teams.append(team)
