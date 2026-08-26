@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .team import Team
+    from .dispatchMeasurements import DispatchMeasurement
 
 
 @dataclass
@@ -76,6 +77,14 @@ class TPG:
         default_factory=dict
     )
 
+    # Per-uarch dispatch latencies, keyed by uarch name then by dispatch size.
+    # Populated from the "Dispatches" array of the
+    # instrDispatch_instrTeams_instrTPG section, when that instrumentation
+    # mode is present in latencies.json.  Empty otherwise.
+    dispatch_latencies: dict[str, dict[int, "DispatchMeasurement"]] = field(
+        default_factory=dict
+    )
+
     def add_team(self, team: "Team") -> None:
         self.teams.append(team)
 
@@ -84,6 +93,30 @@ class TPG:
             if team.id == team_id:
                 return team
         return None
+
+    # ------------------------------------------------------------------ #
+    # Dispatch accessors
+    # ------------------------------------------------------------------ #
+
+    def get_dispatches(self, uarch_name: str) -> dict[int, "DispatchMeasurement"]:
+        """Dispatch measurements on *uarch_name*, keyed by dispatch size."""
+        return self.dispatch_latencies.get(uarch_name, {})
+
+    def dispatch_sizes(self, uarch_name: str) -> list[int]:
+        """Sorted dispatch sizes measured for this TPG on *uarch_name*."""
+        return sorted(self.get_dispatches(uarch_name))
+
+    def has_dispatch_data(self, uarch_name: str | None = None) -> bool:
+        if uarch_name is None:
+            return any(self.dispatch_latencies.values())
+        return bool(self.get_dispatches(uarch_name))
+
+    def __setstate__(self, state: dict) -> None:
+        # Databases pickled before dispatch instrumentation existed.
+        state.setdefault("dispatch_latencies", {})
+        state.setdefault("traversals", {})
+        state.setdefault("class_latencies", {})
+        self.__dict__.update(state)
 
     def __repr__(self) -> str:
         return (

@@ -404,6 +404,10 @@ class Database:
         from analysis.traversal import TraversalAnalyzer
         TraversalAnalyzer.print_summary(self)
 
+        # Dispatch section — only printed when that instrumentation was run.
+        from analysis.dispatch import DispatchAnalyzer
+        DispatchAnalyzer.print_summary(self)
+
     def print_uarch(self, uarch_name: str, max_teams: int | None = None) -> None:
         """
         Print every CompiledTeam measured on uarch_name: code, instructions,

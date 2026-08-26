@@ -52,10 +52,29 @@ from .database import Database
 from .tpg import TPG, ClassLatencyPair
 from .team import Team, CompiledTeam
 from .teamMeasurements import TeamMeasurement
+from .dispatchMeasurements import DispatchMeasurement
 from analysis.disassembler import Disassembler, TeamBlock, TPGLatencyData
 from analysis.traversal import TraversalAnalyzer
 
-_DISASM_FILENAME = "disassembly_tpg_inference_instrTeams_instrTPG.txt"
+# Disassembly file names, most-instrumented first.  The dispatch-instrumented
+# build emits "…_instrDispatch_instrTeams_instrTPG.txt"; earlier builds emit
+# "…_instrTeams_instrTPG.txt".  Team blocks are identical in both — the extra
+# instrumentation lives in the inferenceTPG glue — so either can be parsed.
+_DISASM_FILENAMES = (
+    "disassembly_tpg_inference_instrDispatch_instrTeams_instrTPG.txt",
+    "disassembly_tpg_inference_instrTeams_instrTPG.txt",
+)
+_DISASM_GLOB = "disassembly_tpg_inference*.txt"
+
+
+def _find_disassembly(uarch_dir: Path) -> Path | None:
+    """Locate the disassembly file in *uarch_dir*, whatever its instrumentation."""
+    for name in _DISASM_FILENAMES:
+        candidate = uarch_dir / name
+        if candidate.exists():
+            return candidate
+    matches = sorted(uarch_dir.glob(_DISASM_GLOB))
+    return matches[0] if matches else None
 
 
 class Loader:
@@ -143,12 +162,12 @@ class Loader:
             db:           Database to populate.
         """
         json_path   = uarch_dir / "latencies.json"
-        disasm_path = uarch_dir / _DISASM_FILENAME
+        disasm_path = _find_disassembly(uarch_dir)
 
         if not json_path.exists():
             print(f"[Loader]   SKIP {uarch_dir.name}: missing latencies.json")
             return
-        if not disasm_path.exists():
+        if disasm_path is None:
             print(f"[Loader]   SKIP {uarch_dir.name}: missing disassembly file")
             return
 
@@ -219,6 +238,26 @@ class Loader:
             )
             for cid, teams_cl in lat_data.classes_tpg_teams.items()
         }
+
+        # ── Dispatch latencies (optional instrumentation) ──────────────
+        # Keyed by uarch: like class latencies these are timing figures, and
+        # the dispatch has no per-Team instruction stream of its own.
+        if lat_data.dispatches:
+            tpg.dispatch_latencies[uarch_name] = {
+                size: DispatchMeasurement(
+                    dispatch_size=size,
+                    latency=dl.avg_cycles,
+                    nb_measurements=dl.nb_measurements,
+                    stddev=dl.stddev_cycles,
+                    uarch=uarch,
+                )
+                for size, dl in lat_data.dispatches.items()
+            }
+            print(f"[Loader]   parsed {len(lat_data.dispatches)} dispatch "
+                  f"size(s) {sorted(lat_data.dispatches)} for {uarch_name}")
+        elif lat_data.has_dispatch_data:
+            print(f"[Loader]   note: dispatch section present but empty for "
+                  f"{uarch_name}")
 
         added = reused = skipped_no_lat = code_mismatch = 0
 

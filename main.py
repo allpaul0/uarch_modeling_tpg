@@ -10,6 +10,7 @@ Usage
     python main.py inspect --db <path> --isa  <isa_name>   [--max-teams N]
     python main.py train --db <path> --uarch <uarch_name> [--test-size 0.2] [--seed 42]
     python main.py refresh --db <path> [--save <path>]
+    python main.py train-dispatch --db <path> [--uarch <uarch_name>] [--degree 1]
 
 Model note (v2)
 ---------------
@@ -28,6 +29,7 @@ from classes.database import Database
 from classes.loader import Loader
 from analysis.analyzer import FeaturesAnalyzer
 from analysis.regression import Regressor
+from analysis.dispatch import DispatchAnalyzer, DispatchRegressor
 
 
 def cmd_load(args: argparse.Namespace) -> None:
@@ -131,6 +133,45 @@ def cmd_train(args: argparse.Namespace) -> None:
     model.print_report()
 
 
+def cmd_train_dispatch(args: argparse.Namespace) -> None:
+    """
+    Fit dispatch latency against dispatch size, pooled over every TPG (and
+    therefore every loaded folder) in the database.
+    """
+    db = Database.load(args.db)
+
+    uarch_names = ([args.uarch] if args.uarch
+                   else DispatchAnalyzer.uarchs_with_dispatch_data(db))
+    if not uarch_names:
+        print("[train-dispatch] No dispatch data in this database. Re-load "
+              "result folders produced with the instrDispatch instrumentation.")
+        sys.exit(1)
+
+    for uarch_name in uarch_names:
+        samples = DispatchAnalyzer.collect_samples(db, uarch_name)
+        if not samples:
+            print(f"[train-dispatch] No dispatch samples for {uarch_name!r}")
+            continue
+
+        n_tpgs = len({s.tpg_source_path for s in samples})
+        sizes = sorted({s.dispatch_size for s in samples})
+        print(f"\n[train-dispatch] {len(samples)} samples  "
+              f"uarch={uarch_name!r}  TPGs={n_tpgs}  sizes={sizes}")
+
+        try:
+            model = DispatchRegressor.train(
+                samples,
+                degree=args.degree,
+                weighted=not args.unweighted,
+                test_size=args.test_size,
+                random_state=args.seed,
+            )
+        except ValueError as exc:
+            print(f"[train-dispatch] {exc}")
+            continue
+        model.print_report()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -164,6 +205,21 @@ def main() -> None:
     p_ref.add_argument("--force", action="store_true",
                        help="Re-parse even if already up to date")
 
+    p_td = sub.add_parser("train-dispatch",
+                          help="Regress dispatch latency on dispatch size")
+    p_td.add_argument("--db",     required=True, help="Database file")
+    p_td.add_argument("--uarch",  default=None,
+                      help="Uarch to train on (default: every uarch with "
+                           "dispatch data)")
+    p_td.add_argument("--degree", type=int, default=1,
+                      help="Polynomial degree in dispatch size (default: 1)")
+    p_td.add_argument("--unweighted", action="store_true",
+                      help="Do not weight samples by their dispatch-event count")
+    p_td.add_argument("--test-size", type=float, default=0.20,
+                      help="Fraction held out for testing (default: 0.20)")
+    p_td.add_argument("--seed", type=int, default=42,
+                      help="Random seed for the train/test split (default: 42)")
+
     p_tr = sub.add_parser("train", help="Train a Lasso model for one uarch")
     p_tr.add_argument("--db",        required=True, help="Database file")
     p_tr.add_argument("--uarch",     required=True, help="Uarch name to train on")
@@ -179,6 +235,7 @@ def main() -> None:
         "summary": cmd_summary,
         "inspect": cmd_inspect,
         "refresh": cmd_refresh,
+        "train-dispatch": cmd_train_dispatch,
         "train":   cmd_train,
     }
     dispatch[args.cmd](args)

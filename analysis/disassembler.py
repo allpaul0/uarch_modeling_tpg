@@ -123,6 +123,33 @@ class ClassLatency:
 
 
 @dataclass
+class DispatchLatency:
+    """
+    One entry of the ``Dispatches`` array — the aggregate cost of every
+    dispatch of a given size in one TPG.
+
+    The dispatch is the control step following a Team's execution: the
+    programs' results are compared and the winner selects the next
+    destination (Team or Action).  It is instrumented as a whole (via the
+    ``dispatch_start`` / ``dispatch_end`` probes in ``inferenceTPG``) and
+    reported per ``DispatchSize``, with no instruction-level breakdown.
+
+    Attributes
+    ----------
+    dispatch_size:         The "DispatchSize" field — number of programs compared.
+    nb_measurements:       "Count" — number of dispatch events averaged.
+    avg_cycles:            "AvgCyclesPerDispatch".
+    stddev_cycles:         "StddevCyclesPerDispatch".
+    coefficient_variation: "CoefficientVariation".
+    """
+    dispatch_size: int
+    nb_measurements: int
+    avg_cycles: float
+    stddev_cycles: float
+    coefficient_variation: float
+
+
+@dataclass
 class TPGLatencyData:
     """
     All latency information parsed from one JSON results file.
@@ -153,6 +180,11 @@ class TPGLatencyData:
     team_latencies:     Dict team_id → TeamLatency (instrTeams_instrTPG.Teams).
     classes_tpg_only:   Dict class_id → ClassLatency from ``instrTPG``.
     classes_tpg_teams:  Dict class_id → ClassLatency from ``instrTeams_instrTPG``.
+    dispatches:         Dict dispatch_size → DispatchLatency, from the
+                        ``Dispatches`` array of
+                        ``instrDispatch_instrTeams_instrTPG``.  Empty when the
+                        build was not dispatch-instrumented.
+    has_dispatch_data:  Whether that section was present at all.
     """
     simulator: str
     isa: str
@@ -165,6 +197,12 @@ class TPGLatencyData:
     tpg_only_stddev_lat: float = 0.0
     classes_tpg_only:  dict[int, ClassLatency] = field(default_factory=dict)
     classes_tpg_teams: dict[int, ClassLatency] = field(default_factory=dict)
+    dispatches:        dict[int, DispatchLatency] = field(default_factory=dict)
+    has_dispatch_data: bool = False
+
+    def get_dispatch_latency(self, dispatch_size: int) -> "DispatchLatency | None":
+        """Return the DispatchLatency for *dispatch_size*, or None."""
+        return self.dispatches.get(dispatch_size)
 
     def get_team_latency(self, team_id: int) -> TeamLatency | None:
         """Return the TeamLatency for *team_id*, or None if not measured."""
@@ -275,14 +313,21 @@ class Disassembler:
     @staticmethod
     def parse_latency_json(path: str) -> TPGLatencyData:
         """
-        Parse a JSON results file.  Only ``instrTeams_instrTPG.Teams`` is used
-        for per-team latencies.
+        Parse a JSON results file.
+
+        ``instrTeams_instrTPG.Teams`` supplies the per-team latencies, the two
+        whole-TPG sections supply the per-class figures, and — when present —
+        ``instrDispatch_instrTeams_instrTPG.Dispatches`` supplies the
+        per-dispatch-size figures.
         """
         with open(path, "r") as fh:
             data: dict = json.load(fh)
 
         section = data["instrTeams_instrTPG"]          # TPG + teams instrumented
         tpg_only_section = data.get("instrTPG", {})    # TPG-only instrumented
+        # Dispatch instrumentation is optional: older result folders have no
+        # such section and simply produce no dispatch data.
+        dispatch_section = data.get("instrDispatch_instrTeams_instrTPG", {})
 
         team_latencies: dict[int, TeamLatency] = {}
         for entry in section.get("Teams", []):
@@ -308,6 +353,17 @@ class Disassembler:
                 )
             return out
 
+        dispatches: dict[int, DispatchLatency] = {}
+        for entry in dispatch_section.get("Dispatches", []):
+            size = int(entry["DispatchSize"])
+            dispatches[size] = DispatchLatency(
+                dispatch_size=size,
+                nb_measurements=int(entry["Count"]),
+                avg_cycles=float(entry["AvgCyclesPerDispatch"]),
+                stddev_cycles=float(entry["StddevCyclesPerDispatch"]),
+                coefficient_variation=float(entry["CoefficientVariation"]),
+            )
+
         return TPGLatencyData(
             simulator=data["simulator"],
             isa=data["isa"],
@@ -320,6 +376,8 @@ class Disassembler:
             tpg_only_stddev_lat=float(tpg_only_section.get("tpg_stddev_lat", 0.0)),
             classes_tpg_only=_parse_classes(tpg_only_section),
             classes_tpg_teams=_parse_classes(section),
+            dispatches=dispatches,
+            has_dispatch_data=bool(dispatch_section),
         )
 
     # ------------------------------------------------------------------ #
