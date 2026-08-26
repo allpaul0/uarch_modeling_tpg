@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 from .isa import ISA
+from .instruction import INSTRUCTION_PARSER_VERSION
 
 if TYPE_CHECKING:
     from .uarch import Uarch
@@ -38,12 +39,15 @@ class CompiledTeam:
     feature_vector: Static feature representation extracted from instructions
                     (ISA-determined, uarch-independent).
     measurements:   uarch name -> TeamMeasurement taken on that uarch.
+    parser_version: Version of the instruction parser that produced
+                    ``instructions``; see :meth:`refresh_instructions`.
     """
     isa: ISA
     code: str
     instructions: list["Instruction"] = field(default_factory=list)
     feature_vector: Optional["FeatureVector"] = None
     measurements: dict[str, "TeamMeasurement"] = field(default_factory=dict)
+    parser_version: int = INSTRUCTION_PARSER_VERSION
 
     # ------------------------------------------------------------------ #
     # Accessors
@@ -53,6 +57,35 @@ class CompiledTeam:
     def isa_name(self) -> str:
         """The ISA string this team was compiled for."""
         return self.isa.name if self.isa is not None else ""
+
+    def refresh_instructions(self, force: bool = False) -> bool:
+        """
+        Re-parse ``instructions`` from the stored disassembly ``code`` when
+        they were produced by an older instruction parser.
+
+        ``code`` is the verbatim objdump text, so it still carries everything
+        a newer parser needs — notably the ``<expf>`` callee annotations that
+        parser version 1 threw away.  This makes an existing database usable
+        after a parser change without re-loading it from the result folders.
+
+        Args:
+            force: Re-parse even if the version is already current.
+
+        Returns:
+            True if the instructions were re-parsed.
+        """
+        if not force and self.parser_version >= INSTRUCTION_PARSER_VERSION:
+            return False
+        if not self.code:
+            self.parser_version = INSTRUCTION_PARSER_VERSION
+            return False
+
+        from analysis.disassembler import Disassembler
+        self.instructions = Disassembler.parse_assembly(self.code)
+        self.parser_version = INSTRUCTION_PARSER_VERSION
+        # Any cached features were derived from the stale instructions.
+        self.feature_vector = None
+        return True
 
     def add_measurement(
         self,
@@ -123,6 +156,8 @@ class CompiledTeam:
             state["measurements"] = measurements
         state.setdefault("measurements", {})
         state.setdefault("feature_vector", None)
+        # Absent field ⇒ pickled before instruction parsing was versioned.
+        state.setdefault("parser_version", 1)
         self.__dict__.update(state)
 
     def __repr__(self) -> str:

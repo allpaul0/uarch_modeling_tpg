@@ -39,16 +39,26 @@ INSTRUCTION_LATENCY: dict[str, int] = {
 # objdump appends two kinds of trailing annotation that are NOT operands:
 #
 #   1. Bare label:   "blez a7,886 <T2_start+0x1e>"
-#      Captured by  (?:\s+<\S+>)?   before the optional # comment.
+#      Captured by  (?:\s+(<\S+>))?   before the optional # comment.
 #
 #   2. Hash comment: "lw a7,4(a3) # 20000004 <_sp+…>"
 #      Captured by  (?:\s*#.*)?
 #
 # The non-greedy (.+?) stops before either optional suffix, so group 1
 # always contains only mnemonic + clean operands.
+#
+# Group 2 is the bare label, kept rather than discarded: for a call
+# ("jal ra,884 <expf>") it names the callee, which Instruction folds into
+# its `operation` so that jal expf / jal logf / jal sinf are distinct
+# operations.  For every other instruction it is still ignored.
 _LINE_RE = re.compile(
-    r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+(.+?)(?:\s+<\S+>)?(?:\s*#.*)?$"
+    r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+(.+?)(?:\s+(<\S+>))?(?:\s*#.*)?$"
 )
+
+
+def _instruction_from_match(m: "re.Match[str]") -> Instruction:
+    """Build an Instruction from a _LINE_RE match, keeping the call symbol."""
+    return Instruction.parse(m.group(1).strip(), symbol=m.group(2))
 
 # Matches an exact team label line, e.g. "000007c2 <T0_start>:"
 _TEAM_LABEL_RE = re.compile(r"^[0-9a-f]{8} <T(\d+)_(start|end)>:\s*$")
@@ -182,7 +192,7 @@ class Disassembler:
         for line in code.splitlines():
             m = _LINE_RE.search(line)
             if m:
-                instructions.append(Instruction.parse(m.group(1).strip()))
+                instructions.append(_instruction_from_match(m))
         return instructions
 
     @staticmethod
@@ -254,7 +264,7 @@ class Disassembler:
                 raw_lines.append(line)
                 instr_m = _LINE_RE.search(line)
                 if instr_m:
-                    instructions.append(Instruction.parse(instr_m.group(1).strip()))
+                    instructions.append(_instruction_from_match(instr_m))
 
         return blocks
 

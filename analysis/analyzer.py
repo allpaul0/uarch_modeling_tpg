@@ -25,19 +25,29 @@ class FeaturesAnalyzer:
 
     Features produced
     -----------------
-    Per-mnemonic counts  → "<MNEM>_count"
-        One entry per distinct mnemonic observed.  These are the atomic,
-        independent count features.  Category-level aggregates (load_count,
-        store_count, …) are intentionally NOT included: they are exact linear
-        combinations of the per-mnemonic counts (e.g. load_count = lw_count +
-        lh_count + …) and would introduce perfect multicollinearity, corrupting
-        any linear model including Lasso.  total_instructions is likewise the
-        sum of all per-mnemonic counts and is excluded for the same reason.
+    Per-operation counts → "<OP>_count"
+        One entry per distinct operation observed, where an operation is the
+        mnemonic (Instruction.operation) — except for calls, where the callee
+        is part of the identity: "jal_expf_count", "jal_logf_count" and
+        "jal_sinf_count" are three separate features, exactly as "add_count"
+        and "mul_count" are.  Collapsing them into one "jal_count" would
+        average together calls whose cost differs by orders of magnitude and
+        make the coefficient meaningless.
+
+        These are the atomic, independent count features.  Category-level
+        aggregates (load_count, store_count, …) are intentionally NOT included:
+        they are exact linear combinations of the per-operation counts (e.g.
+        load_count = lw_count + lh_count + …) and would introduce perfect
+        multicollinearity, corrupting any linear model including Lasso.
+        total_instructions is likewise the sum of all per-operation counts and
+        is excluded for the same reason.
 
     RAW hazards          → "raw_d<N>_<PRODUCER>_<CONSUMER>_count"
         Count of Read-After-Write hazards, broken down by:
           - look-back distance N (1, 2 or 3 instructions apart), and
-          - the (producer mnemonic, consumer mnemonic) pair involved.
+          - the (producer operation, consumer operation) pair involved —
+            same notion of operation as the counts above, so a hazard feeding
+            "jal_expf" is distinct from one feeding "jal_logf".
         A distance-1 hazard between e.g. "lw" and "add" is tracked
         separately from a distance-1 hazard between "lw" and "sub", and
         separately again from a distance-2 hazard between the same two
@@ -48,7 +58,7 @@ class FeaturesAnalyzer:
         would be an exact sum of these finer-grained features.
 
     Bigram transitions   → "<A>_<B>_transition"
-        Counts of consecutive mnemonic pairs.  These capture instruction-
+        Counts of consecutive operation pairs.  These capture instruction-
         ordering information that individual counts cannot express.
     """
 
@@ -74,15 +84,17 @@ class FeaturesAnalyzer:
 
         values: dict[str, float] = {}
 
-        mnemonics = [i.mnemonic.lower() for i in instructions]
+        # Instruction.operation is the mnemonic, with the callee appended for
+        # calls ("jal_expf"), so each library call is its own operation.
+        operations = [i.operation for i in instructions]
 
-        # -- Per-mnemonic counts ------------------------------------------
-        # Each mnemonic gets its own independent count feature.
+        # -- Per-operation counts -----------------------------------------
+        # Each operation gets its own independent count feature.
         # No category aggregates and no total_instructions — they are linear
         # combinations of these counts and must not appear alongside them.
-        mnem_counts = Counter(mnemonics)
-        for mnem, cnt in mnem_counts.items():
-            values[f"{mnem}_count"] = float(cnt)
+        op_counts = Counter(operations)
+        for op, cnt in op_counts.items():
+            values[f"{op}_count"] = float(cnt)
 
         # -- RAW hazards, split by distance and producer/consumer pair ----
         raw_counts = FeaturesAnalyzer._raw_hazard_counts(instructions)
@@ -90,7 +102,7 @@ class FeaturesAnalyzer:
             values[f"raw_d{distance}_{producer}_{consumer}_count"] = float(cnt)
 
         # -- Bigram transitions -------------------------------------------
-        #for (a, b), cnt in FeaturesAnalyzer._bigram_counts(mnemonics).items():
+        #for (a, b), cnt in FeaturesAnalyzer._bigram_counts(operations).items():
         #    values[f"{a}_{b}_transition"] = float(cnt)
 
         # -- Length of instructions ---------------------------------------
@@ -138,7 +150,7 @@ class FeaturesAnalyzer:
     ) -> Counter:
         """
         Count Read-After-Write (RAW) hazards, keyed by
-        (distance, producer_mnemonic, consumer_mnemonic).
+        (distance, producer_operation, consumer_operation).
 
         For every instruction (the "consumer") we look back up to
         `max_distance` predecessors. For each look-back distance d in
@@ -163,7 +175,7 @@ class FeaturesAnalyzer:
             max_distance: Largest look-back distance to consider (default 3).
 
         Returns:
-            Counter mapping (distance, producer_mnemonic, consumer_mnemonic)
+            Counter mapping (distance, producer_operation, consumer_operation)
             to the number of times that exact hazard pattern occurred.
         """
         counts: Counter = Counter()
@@ -184,14 +196,14 @@ class FeaturesAnalyzer:
                 if uses & defs:
                     key = (
                         distance,
-                        producer.mnemonic.lower(),
-                        consumer.mnemonic.lower(),
+                        producer.operation,
+                        consumer.operation,
                     )
                     counts[key] += 1
 
         return counts
 
     @staticmethod
-    def _bigram_counts(mnemonics: list[str]) -> Counter:
-        """Return counts of consecutive mnemonic pairs."""
-        return Counter(zip(mnemonics, mnemonics[1:]))
+    def _bigram_counts(operations: list[str]) -> Counter:
+        """Return counts of consecutive operation pairs."""
+        return Counter(zip(operations, operations[1:]))

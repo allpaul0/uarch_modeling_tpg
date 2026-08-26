@@ -265,6 +265,30 @@ class Database:
         for _tpg, _tid, ct in self.all_compiled_teams():
             ct.isa = canonical(ct.isa) or ISA(name="")
 
+    def refresh_instructions(self, force: bool = False) -> int:
+        """
+        Re-parse the instructions of every CompiledTeam whose parser version
+        is out of date (see :meth:`CompiledTeam.refresh_instructions`).
+
+        Needed after a change to what the parser records — e.g. keeping the
+        callee of a call so that ``jal expf`` and ``jal logf`` count as
+        different operations.  The stored disassembly text is the source, so
+        no result folder has to be re-read; save the database afterwards to
+        make it stick.
+
+        Returns:
+            Number of CompiledTeams whose instructions were re-parsed.
+        """
+        n = sum(
+            1
+            for _tpg, _tid, ct in self.all_compiled_teams()
+            if ct.refresh_instructions(force=force)
+        )
+        if n:
+            print(f"[Database] Re-parsed instructions of {n} compiled team(s) "
+                  f"with the current parser (call targets are now kept)")
+        return n
+
     def consolidate_compiled_teams(self) -> int:
         """
         Merge CompiledTeams of the same Team that share an ISA *and* identical
@@ -417,7 +441,9 @@ class Database:
             print(ct.code)
             print(f"\n  Instructions ({len(ct.instructions)}):")
             for instr in ct.instructions:
-                print(f"    {instr.mnemonic:<12} {' '.join(instr.operands)}")
+                # `operation` carries the callee for calls (jal_expf, …),
+                # which is what the feature names are built from.
+                print(f"    {instr.operation:<20} {' '.join(instr.operands)}")
 
             if ct.feature_vector and ct.feature_vector.values:
                 fv = ct.feature_vector

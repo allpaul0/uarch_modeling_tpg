@@ -9,6 +9,7 @@ Usage
     python main.py inspect --db <path> --uarch <uarch_name> [--max-teams N]
     python main.py inspect --db <path> --isa  <isa_name>   [--max-teams N]
     python main.py train --db <path> --uarch <uarch_name> [--test-size 0.2] [--seed 42]
+    python main.py refresh --db <path> [--save <path>]
 
 Model note (v2)
 ---------------
@@ -41,6 +42,15 @@ def cmd_load(args: argparse.Namespace) -> None:
     save_path = args.save or args.db
     if save_path:
         db.save(save_path)
+
+
+def cmd_refresh(args: argparse.Namespace) -> None:
+    """Re-parse stored disassembly with the current instruction parser."""
+    db = Database.load(args.db)
+    n = db.refresh_instructions(force=args.force)
+    if not n:
+        print("[refresh] Nothing to do — all instructions are up to date.")
+    db.save(args.save or args.db)
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -79,6 +89,7 @@ def cmd_inspect(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     db = Database.load(args.db)
+    db.refresh_instructions()
 
     if args.isa:
         _compute_features_for_isa(db, args.isa)
@@ -90,6 +101,9 @@ def cmd_inspect(args: argparse.Namespace) -> None:
 
 def cmd_train(args: argparse.Namespace) -> None:
     db = Database.load(args.db)
+    # Databases loaded before a parser change are brought up to date in
+    # memory; run `main.py refresh` to persist it.
+    db.refresh_instructions()
 
     # One sample per (CompiledTeam, measurement-on-this-uarch) pair.
     quads = db.get_measurements_for_uarch(args.uarch)
@@ -141,6 +155,15 @@ def main() -> None:
     p_ins.add_argument("--max-teams", type=int, default=None,
                        help="Limit number of teams printed")
 
+    p_ref = sub.add_parser("refresh",
+                           help="Re-parse stored disassembly with the current "
+                                "instruction parser and save")
+    p_ref.add_argument("--db",   required=True, help="Database file")
+    p_ref.add_argument("--save", default=None,
+                       help="Where to write the result (defaults to --db)")
+    p_ref.add_argument("--force", action="store_true",
+                       help="Re-parse even if already up to date")
+
     p_tr = sub.add_parser("train", help="Train a Lasso model for one uarch")
     p_tr.add_argument("--db",        required=True, help="Database file")
     p_tr.add_argument("--uarch",     required=True, help="Uarch name to train on")
@@ -155,6 +178,7 @@ def main() -> None:
         "load":    cmd_load,
         "summary": cmd_summary,
         "inspect": cmd_inspect,
+        "refresh": cmd_refresh,
         "train":   cmd_train,
     }
     dispatch[args.cmd](args)
