@@ -19,8 +19,20 @@ Folder layout expected::
         └── …
 
 One seed directory = one TPG.  Each subdirectory of ``inference/results/``
-is one (uarch × ISA) compilation: it has its own disassembly and latency
-JSON, and maps to exactly one CompiledTeam per Team.
+is one (uarch × ISA) run: it has its own disassembly and latency JSON.
+
+v2 ingestion model
+------------------
+The disassembly of a run describes code compiled for the run's *ISA*, while
+the JSON latencies describe how that code behaved on the run's *uarch*.  So
+each uarch directory produces, per team:
+
+  * one CompiledTeam per ISA — created the first time that ISA is seen for
+    the team, then **reused** by every later uarch implementing the same ISA;
+  * one TeamMeasurement attached to that CompiledTeam under the uarch name.
+
+Two directories that differ only by uarch therefore share a single
+CompiledTeam (one code/instruction/feature copy) carrying two measurements.
 
 Identity vs. display
 --------------------
@@ -40,7 +52,6 @@ from .database import Database
 from .tpg import TPG, ClassLatencyPair
 from .team import Team, CompiledTeam
 from .teamMeasurements import TeamMeasurement
-from .uarch import Uarch
 from analysis.disassembler import Disassembler, TeamBlock, TPGLatencyData
 from analysis.traversal import TraversalAnalyzer
 
@@ -60,7 +71,8 @@ class Loader:
         Recursively find every ``inference/results/`` directory under *root*,
         iterate its uarch subdirectories, and populate a Database.
 
-        Already-loaded (source_path, uarch) pairs are silently skipped.
+        Already-loaded (source_path, uarch, isa) combinations are silently
+        skipped.
 
         Args:
             root: Top-level model directory to scan.
@@ -120,8 +132,9 @@ class Loader:
         """
         Load one ``<uarch_isa_abi_dtype>/`` subdirectory.
 
-        Parses the local disassembly and latency JSON, then creates one
-        CompiledTeam per team and attaches it to the corresponding Team.
+        Parses the local disassembly and latency JSON, then, for each team,
+        finds (or creates) the CompiledTeam for this run's ISA and attaches
+        the measurement taken on this run's uarch.
 
         Args:
             uarch_dir:    Path to the uarch subdirectory.
@@ -141,6 +154,7 @@ class Loader:
 
         lat_data: TPGLatencyData = Disassembler.parse_latency_json(str(json_path))
         uarch_name = lat_data.simulator
+        isa_name   = lat_data.isa
 
         # Guard: directory name must be "<uarch>_rv32<isa>_<abi>_<dtype>".
         # The uarch prefix (everything before the first "_rv32" token) must
@@ -157,16 +171,19 @@ class Loader:
                 f"  latencies.json: {uarch_name}"
             )
 
-        # Dedup check uses source_path (not display_name) as the TPG key.
-        if db.is_loaded(source_path, uarch_name):
-            print(f"[Loader]   SKIP (already loaded): {display_name} × {uarch_name}")
+        # Dedup check uses source_path (not display_name) as the TPG key, and
+        # now the ISA too — the same simulator may appear for several ISAs.
+        if db.is_loaded(source_path, uarch_name, isa_name):
+            print(f"[Loader]   SKIP (already loaded): {display_name} × "
+                  f"{uarch_name} × {isa_name}")
             return
 
         blocks: dict[int, TeamBlock] = Disassembler.parse_tpg_file(str(disasm_path))
 
+        isa = db.get_or_create_isa(isa_name)
         uarch = db.get_or_create_uarch(
             name=uarch_name,
-            isa=lat_data.isa,
+            isa=isa,
             abi=lat_data.abi,
         )
         tpg = db.get_or_create_tpg(
@@ -189,6 +206,7 @@ class Loader:
                       f"under {le_path.parent}")
 
         # ── Whole-TPG class latencies for both instrumentation modes ───
+        # Keyed by uarch: these are timing figures, not compilation data.
         tpg.class_latencies[uarch_name] = {
             cid: ClassLatencyPair(
                 class_id=cid,
@@ -202,7 +220,7 @@ class Loader:
             for cid, teams_cl in lat_data.classes_tpg_teams.items()
         }
 
-        added = skipped_no_lat = 0
+        added = reused = skipped_no_lat = code_mismatch = 0
 
         for team_id, block in sorted(blocks.items()):
             tl = lat_data.get_team_latency(team_id)
@@ -210,7 +228,7 @@ class Loader:
                 skipped_no_lat += 1
                 continue
 
-            # Get or create the Team (identity node, ISA-agnostic).
+            # Get or create the Team (identity node, ISA/uarch-agnostic).
             # Team IDs are only unique within a TPG — the tpg object here
             # is always the correct one because it was fetched by source_path.
             team = tpg.get_team(team_id)
@@ -218,27 +236,47 @@ class Loader:
                 team = Team(id=team_id)
                 tpg.add_team(team)
 
+            # Get or create the CompiledTeam for this ISA.  A second uarch
+            # implementing the same ISA reuses the existing one and only
+            # contributes an extra measurement.
+            ct = team.get_compiled_for_isa(isa)
+            if ct is None:
+                # feature_vector is intentionally left None at load time.
+                # It is computed at training time so feature extraction rules
+                # can be changed freely without reloading the database.
+                ct = CompiledTeam(
+                    isa=isa,
+                    code=block.code,
+                    instructions=block.instructions,
+                )
+                team.add_compiled_team(ct)
+                added += 1
+            else:
+                reused += 1
+                if ct.code != block.code:
+                    # Same ISA should mean identical code; if it does not,
+                    # keep the first version and flag it rather than silently
+                    # mixing two binaries under one CompiledTeam.
+                    code_mismatch += 1
+
             meas = TeamMeasurement(
                 latency=tl.avg_cycles,
                 nb_measurements=tl.nb_measurements,
                 stddev=tl.stddev_cycles,
-            )
-            # feature_vector is intentionally left None at load time.
-            # It is computed at training time so feature extraction rules
-            # can be changed freely without reloading the database.
-            ct = CompiledTeam(
                 uarch=uarch,
-                code=block.code,
-                instructions=block.instructions,
-                measurement=meas,
             )
-            team.add_compiled_team(ct)
-            added += 1
+            ct.add_measurement(meas, uarch=uarch)
 
-        db.mark_loaded(source_path, uarch_name)
+        db.mark_loaded(source_path, uarch_name, isa_name)
         print(
             f"[Loader]   + {display_name}"
-            f"\n             uarch={uarch_name}"
-            f"  added={added} compiled teams"
+            f"\n             uarch={uarch_name}  isa={isa_name}"
+            f"  new compiled teams={added}"
+            f"  reused={reused}"
+            f"  measurements added={added + reused}"
             f"  skipped={skipped_no_lat} (no latency data)"
         )
+        if code_mismatch:
+            print(f"[Loader]   Warning: {code_mismatch} team(s) had different "
+                  f"disassembly for isa={isa_name} than the already-loaded "
+                  f"compilation; kept the first one.")

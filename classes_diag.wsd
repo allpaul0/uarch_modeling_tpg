@@ -1,20 +1,18 @@
 @startuml
 
-' =====================================
-' TPG DOMAIN
-' =====================================
+' ========= V2 =========
 
+' ===== TPG DOMAIN =====
 class TPG {
     + name : String
     + dtype : String
-    + GPIS : List<String>
+    + GP instruction set : List<String>
+}
+class Team { 
+    + id : Integer 
 }
 
-class Team {
-    + id : Integer
-}
-
-class CompiledTeam {
+class TeamCompiled { 
     + code : String
 }
 
@@ -24,71 +22,59 @@ class Instruction {
 }
 
 TPG "1" *-- "1..*" Team : contains
-Team "1" *-- "1..*" CompiledTeam : compiled as
+Team "1" *-- "1..*" TeamCompiled : compiled as
+TeamCompiled "1" *-- "1..*" Instruction
 
-' =====================================
-' MICROARCHITECTURE
-' =====================================
-
-class Uarch {
-    + name : String
-    + isa : String
-    + abi : String
+' ===== COMPILATION TARGET (assembly level) =====
+class ISA {
+    + name : String n
 }
+TeamCompiled "1..*" --> "1" ISA : compiled for
 
-CompiledTeam "1..*" --> "1" Uarch : targets
-
-' =====================================
-' MEASURED PERFORMANCE
-' =====================================
-
-class TeamMeasurement {
-    + latencyAvg : Float
-    + latencyStdDev : Float
-    + count : Integer
-}
-
-CompiledTeam "1" *-- "1" TeamMeasurement
-
-' =====================================
-' FEATURE EXTRACTION
-' =====================================
-
+' ===== STATIC FEATURES (per compiled binary, ISA-determined) =====
 class FeatureVector {
     + values : Map<String, Float>
 }
+TeamCompiled "1" *-- "1" FeatureVector
 
-CompiledTeam "1" *-- "1..*" Instruction
-CompiledTeam "1" *-- "1" FeatureVector
+' ===== MICROARCHITECTURE =====
+class Uarch {
+    + name : String
+    + abi : String
+}
+Uarch "1..*" --> "1" ISA : implements
 
+' ===== THE HUB: one measurement = one (TeamCompiled, Uarch) point =====
+class TeamMeasurement {
+    + latencyAvg : Float
+    + latencyStdDev : Float
+    + nbMeasurements : Integer
+}
+TeamCompiled "1" *-- "1..*" TeamMeasurement : measured as
+TeamMeasurement "0..*" --> "1" Uarch : on
+
+' ===== TOOLING =====
 class Disassembler {
-    + parseTpgFile(path : String) : Map<TeamId, TeamBlock>
+    + parseAssembly(code: String) : List<Instruction>
     + parseLatencyJson(path : String) : TPGLatencyData
 }
-
 class FeaturesAnalyzer {
     + analyzeInstructions(instructions : List<Instruction>) : FeatureVector
 }
-
-Disassembler ..> CompiledTeam : parses
-Disassembler ..> Instruction : produces
-FeaturesAnalyzer ..> Instruction : analyzes
+Disassembler   ..> TeamCompiled : parses
+Disassembler   ..> Instruction  : produces
+FeaturesAnalyzer ..> Instruction  : analyzes
 FeaturesAnalyzer ..> FeatureVector : produces
 
-' =====================================
-' LATENCY MODEL
-' =====================================
-
+' ===== LATENCY MODEL =====
 class RegressionModel {
     + weights : Map<String, Float>
     + bias : Float
 }
-
 class Regressor {
-    + train(features : List<FeatureVector>, latencies : List<Float>) : RegressionModel
+    + train(features : List<FeatureVector>, measurements : List<TeamMeasurement>) : RegressionModel
     + predict(features : FeatureVector) : Float
 }
-
 Regressor ..> RegressionModel : produces
 Regressor ..> FeatureVector : takes training data
 Regressor ..> TeamMeasurement : takes latency labels

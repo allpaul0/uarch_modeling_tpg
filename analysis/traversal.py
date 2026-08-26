@@ -24,8 +24,9 @@ This module owns *all* the work requested on top of the base pipeline:
     measures can be compared traversal by traversal.
 
 Everything here reads data already stored on the model (``TPG.traversals``,
-``TPG.class_latencies`` and the per-team ``CompiledTeam.measurement``), so it
-works purely from a loaded/pickled Database — no re-reading of source files.
+``TPG.class_latencies`` and the per-uarch ``TeamMeasurement`` objects owned by
+each ``CompiledTeam``), so it works purely from a loaded/pickled Database — no
+re-reading of source files.
 """
 
 from __future__ import annotations
@@ -152,14 +153,20 @@ class TraversalAnalyzer:
 
     @staticmethod
     def _team_latency(tpg: "TPG", team_id: int, uarch_name: str) -> float | None:
-        """Measured AvgCyclesPerTeam for one team on one uarch, or None."""
+        """
+        Measured AvgCyclesPerTeam for one team on one uarch, or None.
+
+        Since the v2 model a Team holds one CompiledTeam per ISA, each
+        carrying one measurement per uarch it ran on, so the lookup goes
+        through the uarch name rather than through a single measurement.
+        """
         team = tpg.get_team(team_id)
         if team is None:
             return None
-        ct = team.get_compiled_for_uarch(uarch_name)
-        if ct is None or ct.measurement is None:
+        meas = team.get_measurement_for_uarch(uarch_name)
+        if meas is None:
             return None
-        return ct.measurement.latency
+        return meas.latency
 
     @staticmethod
     def analyze_tpg(tpg: "TPG", uarch_name: str) -> list[TraversalReport]:
@@ -300,9 +307,10 @@ class TraversalAnalyzer:
             if not uarch_names:
                 # Fall back to uarchs seen on compiled teams (no class data).
                 uarch_names = sorted({
-                    ct.uarch.name
+                    name
                     for team in tpg.teams
                     for ct in team.compiled_teams
+                    for name in ct.uarch_names()
                 })
             for uarch_name in uarch_names:
                 if uarch_name in tpg.class_latencies or tpg.traversals:
