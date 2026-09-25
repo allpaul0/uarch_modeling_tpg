@@ -11,6 +11,7 @@ Usage
     python main.py train --db <path> --uarch <uarch_name> [--test-size 0.2] [--seed 42]
     python main.py refresh --db <path> [--save <path>]
     python main.py train-dispatch --db <path> [--uarch <uarch_name>] [--degree 1]
+    python main.py train-dispatch --db <path> --breakpoint 5     # two regimes
 
 Model note (v2)
 ---------------
@@ -153,16 +154,46 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
             print(f"[train-dispatch] No dispatch samples for {uarch_name!r}")
             continue
 
+        # Sizes backed by too few dispatch events are dropped before fitting:
+        # their means rest on almost nothing, so they distort the fit without
+        # informing it.  The threshold is on the size total across all TPGs.
+        if args.min_events > 0 or args.min_tpgs > 0:
+            samples, dropped = DispatchAnalyzer.filter_by_events(
+                samples, min_events=args.min_events, min_tpgs=args.min_tpgs,
+            )
+            for st in dropped:
+                print(f"[train-dispatch] ignoring size {st.dispatch_size}: "
+                      f"{st.n_events} events over {st.n_samples} TPG(s) "
+                      f"(min {args.min_events} events"
+                      + (f", {args.min_tpgs} TPGs" if args.min_tpgs else "")
+                      + ")")
+            if not samples:
+                print(f"[train-dispatch] every size was filtered out for "
+                      f"{uarch_name!r}; lower --min-events to keep some.")
+                continue
+
         n_tpgs = len({s.tpg_source_path for s in samples})
         sizes = sorted({s.dispatch_size for s in samples})
         print(f"\n[train-dispatch] {len(samples)} samples  "
               f"uarch={uarch_name!r}  TPGs={n_tpgs}  sizes={sizes}")
 
+        breakpoint_ = args.breakpoint
+        if breakpoint_ is None and args.auto_breakpoint:
+            breakpoint_ = DispatchAnalyzer.suggest_breakpoint(samples)
+            if breakpoint_ is not None:
+                print(f"[train-dispatch] auto-detected breakpoint at size "
+                      f"{breakpoint_}")
+            else:
+                print("[train-dispatch] no clear breakpoint detected — "
+                      "fitting a single regime")
+
         try:
             model = DispatchRegressor.train(
                 samples,
                 degree=args.degree,
+                breakpoint=breakpoint_,
                 weighted=not args.unweighted,
+                robust=args.robust,
                 test_size=args.test_size,
                 random_state=args.seed,
             )
@@ -170,6 +201,14 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
             print(f"[train-dispatch] {exc}")
             continue
         model.print_report()
+
+        # A single-regime fit that leaves a clear kink is worth flagging.
+        if breakpoint_ is None:
+            hint = DispatchAnalyzer.suggest_breakpoint(samples)
+            if hint is not None:
+                print(f"\n  Hint: the marginal cost jumps at size {hint}. "
+                      f"A polynomial cannot fit a step — try "
+                      f"`--breakpoint {hint}`.")
 
 
 def main() -> None:
@@ -213,6 +252,22 @@ def main() -> None:
                            "dispatch data)")
     p_td.add_argument("--degree", type=int, default=1,
                       help="Polynomial degree in dispatch size (default: 1)")
+    p_td.add_argument("--breakpoint", type=int, default=None,
+                      help="Fit two regimes, with a level shift and slope "
+                           "change at this dispatch size")
+    p_td.add_argument("--auto-breakpoint", action="store_true",
+                      help="Detect the breakpoint from the data instead of "
+                           "passing it explicitly")
+    p_td.add_argument("--min-events", type=int, default=100,
+                      help="Ignore dispatch sizes whose total event count "
+                           "across all TPGs is below this (default: 100; "
+                           "pass 0 to keep everything)")
+    p_td.add_argument("--min-tpgs", type=int, default=0,
+                      help="Ignore dispatch sizes measured in fewer than this "
+                           "many TPGs (default: 0 = no limit)")
+    p_td.add_argument("--robust", action="store_true",
+                      help="Fit with a Huber loss so a few contaminated "
+                           "aggregates cannot dominate the coefficients")
     p_td.add_argument("--unweighted", action="store_true",
                       help="Do not weight samples by their dispatch-event count")
     p_td.add_argument("--test-size", type=float, default=0.20,

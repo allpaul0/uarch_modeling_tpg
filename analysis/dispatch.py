@@ -10,7 +10,7 @@ extract features from.
 
 The model is therefore a small, explicit one::
 
-    cycles(dispatch) ≈ bias + w1·size [+ w2·size² …]
+    cycles(dispatch) ≈ bias + w1·size [+ w2·size² …] [+ piecewise terms]
 
 where ``bias`` is the fixed dispatch overhead (probe, bookkeeping, the final
 jump) and ``w1`` is the marginal cost of comparing one more program.  Samples
@@ -18,15 +18,22 @@ are pooled across every TPG and every loaded folder in the Database, exactly
 like the team-level pipeline: one sample = one (TPG, uarch, dispatch size)
 aggregate.
 
-Two details matter for getting sensible numbers out of it:
+Three details matter for getting sensible numbers out of it:
 
 *   Each sample is already an average over ``Count`` dispatch events, so its
-    precision varies a lot (Count ranges from 10 to 100 in practice).  Fitting
-    is weighted by ``Count`` by default so that well-measured points count for
-    more — this is ordinary weighted least squares, not a heuristic.
-*   Whether the relation is actually linear in size is an empirical question.
-    :meth:`DispatchModel.print_report` prints a per-size residual table so
-    curvature is visible; ``degree=2`` fits a quadratic if it is needed.
+    precision varies a lot (Count ranges from ~10 to ~2000 in practice).
+    Fitting is weighted by ``Count`` by default so that well-measured points
+    count for more — ordinary weighted least squares, not a heuristic.
+*   The relation need not be a single straight line.  Measurements show the
+    marginal cost changing abruptly at a given size (a codegen change:
+    register spills, or an unrolled comparison chain becoming a loop).  A
+    polynomial cannot represent a step, so ``breakpoint`` adds a level shift
+    and a slope change at a chosen size — still linear in the coefficients,
+    still plain least squares.
+*   Size alone can only ever explain so much.  The *saturated* baseline
+    (predict each size's own weighted mean) is the best any size-only model
+    can do, so comparing against it separates "wrong functional form" from
+    "dispatch size is not sufficient".
 """
 
 from __future__ import annotations
@@ -38,19 +45,52 @@ from analysis.regression import RegressionMetrics, TrainTestSplit
 
 if TYPE_CHECKING:
     from classes.database import Database
-    from classes.tpg import TPG
 
 
-# Feature names used by the polynomial basis, in order.
-def _feature_names(degree: int) -> list[str]:
+# A per-size aggregate resting on fewer samples/events than these is flagged
+# in the report: its mean is thin evidence, however confident the fit looks.
+_SPARSE_MIN_SAMPLES = 5
+_SPARSE_MIN_EVENTS  = 100
+
+
+# --------------------------------------------------------------------------- #
+# Design matrix
+# --------------------------------------------------------------------------- #
+
+def _feature_names(degree: int, breakpoint: int | None = None) -> list[str]:
+    """
+    Basis feature names, in coefficient order.
+
+    Polynomial terms first, then — if *breakpoint* is set — the two piecewise
+    terms that let the fit change level and slope at that size.
+    """
     names = ["dispatch_size"]
     for d in range(2, degree + 1):
         names.append(f"dispatch_size^{d}")
+    if breakpoint is not None:
+        names.append(f"step_ge{breakpoint}")
+        names.append(f"extra_slope_ge{breakpoint}")
     return names
 
 
-def _design_row(size: float, degree: int) -> list[float]:
-    return [float(size) ** d for d in range(1, degree + 1)]
+def _design_row(size: float, degree: int,
+                breakpoint: int | None = None) -> list[float]:
+    """
+    One row of the design matrix for a dispatch of *size*.
+
+    With a breakpoint *b* the two extra columns are
+
+        step_ge{b}         = 1 if size >= b else 0       (level shift)
+        extra_slope_ge{b}  = max(0, size - (b - 1))      (hinge, 1 at size b)
+
+    so the fitted marginal cost is ``w1`` below *b* and ``w1 + w_extra`` at or
+    above it, with a one-off jump of ``w_step + w_extra`` at the boundary.
+    """
+    row = [float(size) ** d for d in range(1, degree + 1)]
+    if breakpoint is not None:
+        row.append(1.0 if size >= breakpoint else 0.0)
+        row.append(max(0.0, float(size) - (breakpoint - 1)))
+    return row
 
 
 # --------------------------------------------------------------------------- #
@@ -68,7 +108,7 @@ class DispatchSample:
     tpg_name:        Display name of the owning TPG.
     tpg_source_path: Absolute seed-dir path (unique TPG identity).
     uarch_name:      Micro-architecture the measurement was taken on.
-    dispatch_size:   Number of programs compared — the only feature.
+    dispatch_size:   Number of programs compared — the only raw feature.
     latency:         Measured AvgCyclesPerDispatch (the label).
     nb_measurements: Number of dispatch events averaged (the fit weight).
     stddev:          Spread across those events.
@@ -104,6 +144,17 @@ class DispatchSizeStat:
     def residual(self) -> float:
         return self.mean_latency - self.predicted
 
+    @property
+    def spread(self) -> float:
+        """max − min across the TPGs contributing to this size."""
+        return self.max_latency - self.min_latency
+
+    @property
+    def is_sparse(self) -> bool:
+        """True when this row rests on too little data to trust its mean."""
+        return (self.n_samples < _SPARSE_MIN_SAMPLES
+                or self.n_events < _SPARSE_MIN_EVENTS)
+
 
 # --------------------------------------------------------------------------- #
 # Model
@@ -112,35 +163,43 @@ class DispatchSizeStat:
 @dataclass
 class DispatchModel:
     """
-    A fitted dispatch model: ``cycles ≈ bias + Σ w_d · size^d``.
+    A fitted dispatch model: ``cycles ≈ bias + Σ w_k · basis_k(size)``.
 
     Attributes
     ----------
-    weights:       Coefficient per basis feature ("dispatch_size", …).
-    bias:          Intercept — the size-independent dispatch overhead.
-    degree:        Polynomial degree used (1 = affine in size).
-    weighted:      Whether samples were weighted by their event count.
-    feature_names: Basis feature names, in coefficient order.
-    split:         Train/test split information.
-    train_metrics: MAE / RMSE / R² on the training fold.
-    test_metrics:  MAE / RMSE / R² on the held-out fold.
-    size_stats:    Per-size aggregates with the model's prediction, for
-                   inspecting linearity.
-    noise_floor:   RMSE that pure measurement noise alone would produce
-                   (root-mean-square of the per-sample standard errors).  A
-                   test RMSE near this value means the model is as good as the
-                   data allows; far above it means real structure is missing.
+    weights:        Coefficient per basis feature.
+    bias:           Intercept — the size-independent dispatch overhead.
+    degree:         Polynomial degree in size (1 = affine).
+    breakpoint:     Size at which a level shift and slope change are allowed,
+                    or None for a single regime.
+    weighted:       Whether samples were weighted by their event count.
+    feature_names:  Basis feature names, in coefficient order.
+    split:          Train/test split information.
+    train_metrics:  MAE / RMSE / R² on the training fold.
+    test_metrics:   MAE / RMSE / R² on the held-out fold.
+    saturated_train_metrics / saturated_test_metrics:
+                    Same metrics for the saturated baseline — predicting each
+                    size's own weighted mean (fitted on the training fold).
+                    This is the ceiling for any model using size alone.
+    size_stats:     Per-size aggregates with the model's prediction.
+    noise_floor:    RMSE that measurement noise alone would produce
+                    (root-mean-square of the per-sample standard errors).
     """
     weights:       dict[str, float]
     bias:          float
     degree:        int = 1
+    breakpoint:    int | None = None
     weighted:      bool = True
     feature_names: list[str] = field(default_factory=list)
     split:         TrainTestSplit | None = None
     train_metrics: RegressionMetrics | None = None
     test_metrics:  RegressionMetrics | None = None
+    saturated_train_metrics: RegressionMetrics | None = None
+    saturated_test_metrics:  RegressionMetrics | None = None
     size_stats:    list[DispatchSizeStat] = field(default_factory=list)
     noise_floor:   float = 0.0
+    estimator:     str = "least squares"
+    flagged_outliers: list["DispatchSample"] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Prediction
@@ -149,32 +208,66 @@ class DispatchModel:
     def predict(self, dispatch_size: float) -> float:
         """Predicted cycle cost of a dispatch comparing *dispatch_size* programs."""
         total = self.bias
-        for name, value in zip(_feature_names(self.degree),
-                               _design_row(dispatch_size, self.degree)):
+        names = _feature_names(self.degree, self.breakpoint)
+        row = _design_row(dispatch_size, self.degree, self.breakpoint)
+        for name, value in zip(names, row):
             total += self.weights.get(name, 0.0) * value
         return total
+
+    # ------------------------------------------------------------------ #
+    # Derived quantities
+    # ------------------------------------------------------------------ #
+
+    @property
+    def marginal_cost_low(self) -> float:
+        """Cycles added by one more program below the breakpoint."""
+        return self.weights.get("dispatch_size", 0.0)
+
+    @property
+    def marginal_cost_high(self) -> float:
+        """Cycles added by one more program at/above the breakpoint."""
+        if self.breakpoint is None:
+            return self.marginal_cost_low
+        return self.marginal_cost_low + self.weights.get(
+            f"extra_slope_ge{self.breakpoint}", 0.0)
+
+    @property
+    def step_at_breakpoint(self) -> float:
+        """One-off jump in cycles when crossing into the upper regime."""
+        if self.breakpoint is None:
+            return 0.0
+        return self.predict(self.breakpoint) - (
+            self.predict(self.breakpoint - 1) + self.marginal_cost_low)
 
     # ------------------------------------------------------------------ #
     # Display
     # ------------------------------------------------------------------ #
 
     def formula(self) -> str:
-        """Human-readable formula, e.g. "cycles ≈ 1.83 + 15.62·size"."""
+        """Human-readable formula."""
         parts = [f"{self.bias:.2f}"]
-        for name in _feature_names(self.degree):
+        for name in _feature_names(self.degree, self.breakpoint):
             w = self.weights.get(name, 0.0)
-            exponent = name.split("^")[1] if "^" in name else "1"
-            term = "size" if exponent == "1" else f"size^{exponent}"
-            parts.append(f"{'+' if w >= 0 else '-'} {abs(w):.2f}·{term}")
+            sign = "+" if w >= 0 else "-"
+            if name == "dispatch_size":
+                term = "size"
+            elif name.startswith("dispatch_size^"):
+                term = f"size^{name.split('^')[1]}"
+            elif name.startswith("step_ge"):
+                term = f"[size>={self.breakpoint}]"
+            else:
+                term = f"(size-{self.breakpoint - 1})+"
+            parts.append(f"{sign} {abs(w):.2f}·{term}")
         return "cycles ≈ " + " ".join(parts)
 
     def __repr__(self) -> str:
-        return (f"DispatchModel({self.formula()}, degree={self.degree}, "
+        bp = f", breakpoint={self.breakpoint}" if self.breakpoint else ""
+        return (f"DispatchModel({self.formula()}, degree={self.degree}{bp}, "
                 f"weighted={self.weighted})")
 
     def print_report(self) -> None:
         """Print a human-readable dispatch-regression report."""
-        bar = "─" * 72
+        bar = "─" * 78
         print(f"\n{bar}")
         print("  DISPATCH REGRESSION REPORT")
         print(bar)
@@ -182,40 +275,97 @@ class DispatchModel:
             s = self.split
             print(f"  Dataset split (seed={s.random_state}): "
                   f"{s.n_train} train  /  {s.n_test} test  (total {s.n_total})")
-        print(f"  Basis: degree {self.degree}"
-              f"   weighting: {'by event count' if self.weighted else 'none'}")
+        basis = f"degree {self.degree}"
+        if self.breakpoint is not None:
+            basis += f", piecewise at size {self.breakpoint}"
+        print(f"  Basis: {basis}"
+              f"   weighting: {'by event count' if self.weighted else 'none'}"
+              f"   estimator: {self.estimator}")
         print(f"  Model: {self.formula()}")
-        print(f"  Fixed overhead (bias): {self.bias:.3f} cycles")
-        for name in _feature_names(self.degree):
-            print(f"  Coefficient {name:<18} {self.weights.get(name, 0.0):+.4f}")
+        print(f"  Fixed overhead (bias): {self.bias:.3f} cycles"
+              + ("   <-- negative: physically impossible, the fit is straddling "
+                 "two regimes" if self.bias < 0 else ""))
+        for name in _feature_names(self.degree, self.breakpoint):
+            print(f"  Coefficient {name:<24} {self.weights.get(name, 0.0):+.4f}")
+
+        if self.breakpoint is not None:
+            print(f"\n  Marginal cost per extra program:")
+            print(f"    size <  {self.breakpoint}:  "
+                  f"{self.marginal_cost_low:+.2f} cycles")
+            print(f"    size >= {self.breakpoint}:  "
+                  f"{self.marginal_cost_high:+.2f} cycles")
+            print(f"    one-off step at size {self.breakpoint}: "
+                  f"{self.step_at_breakpoint:+.2f} cycles")
 
         if self.train_metrics:
             print(f"\n  Train metrics:  {self.train_metrics}")
         if self.test_metrics:
             print(f"  Test  metrics:  {self.test_metrics}")
+            ratio = (self.test_metrics.rmse / self.test_metrics.mae
+                     if self.test_metrics.mae else 0.0)
+            note = ("  <-- >2 means a few outliers dominate the squared error"
+                    if ratio > 2.0 else "")
+            print(f"  RMSE/MAE     :  {ratio:.2f}{note}")
+
+        if self.saturated_test_metrics or self.saturated_train_metrics:
+            print(f"\n  Saturated baseline (predict each size's own mean — the "
+                  f"ceiling for any size-only model):")
+            if self.saturated_train_metrics:
+                print(f"    train: {self.saturated_train_metrics}")
+            if self.saturated_test_metrics:
+                print(f"    test : {self.saturated_test_metrics}")
+                if self.test_metrics:
+                    gap = self.test_metrics.rmse - self.saturated_test_metrics.rmse
+                    print(f"    gap to this model: RMSE {gap:+.3f}  "
+                          f"(≈0 ⇒ the functional form is right and the "
+                          f"remaining error is not explainable by size)")
         if self.noise_floor:
-            print(f"  Noise floor  :  RMSE={self.noise_floor:.3f}  "
-                  f"(measurement error alone; a test RMSE near this means the "
-                  f"model is as accurate as the data permits)")
+            print(f"\n  Noise floor  :  RMSE={self.noise_floor:.3f}  "
+                  f"(measurement error alone)")
+
+        if self.flagged_outliers:
+            resisted = (" (the robust fit resisted them; they barely moved "
+                        "the coefficients)" if self.estimator == "huber"
+                        else " (these are pulling the coefficients — consider "
+                             "--robust)")
+            print(f"\n  Samples with residuals over 3x the typical error "
+                  f"({len(self.flagged_outliers)}){resisted}:")
+            worst = sorted(self.flagged_outliers,
+                           key=lambda s: -abs(s.latency - self.predict(s.dispatch_size)))
+            for smp in worst[:8]:
+                pred = self.predict(smp.dispatch_size)
+                print(f"    size {smp.dispatch_size:>2}  measured "
+                      f"{smp.latency:>8.1f}  predicted {pred:>8.1f}  "
+                      f"({smp.latency - pred:+.1f})  "
+                      f"{smp.nb_measurements:>5} events  TPG {smp.tpg_name}")
+            if len(worst) > 8:
+                print(f"    … and {len(worst) - 8} more")
 
         if self.size_stats:
             print(f"\n  Per-size breakdown:")
             header = (f"    {'size':>4} {'n':>4} {'events':>7} "
                       f"{'measured':>10} {'predicted':>10} {'residual':>10} "
-                      f"{'min..max':>17}")
+                      f"{'min..max':>17}  ")
             print(header)
             print("    " + "-" * (len(header) - 4))
+            any_sparse = False
             for st in self.size_stats:
                 span = f"{st.min_latency:.0f}..{st.max_latency:.0f}"
+                mark = "*" if st.is_sparse else " "
+                any_sparse = any_sparse or st.is_sparse
                 print(f"    {st.dispatch_size:>4} {st.n_samples:>4} "
                       f"{st.n_events:>7} {st.mean_latency:>10.2f} "
                       f"{st.predicted:>10.2f} {st.residual:>+10.2f} "
-                      f"{span:>17}")
+                      f"{span:>17} {mark}")
+            if any_sparse:
+                print(f"    * thin evidence: fewer than {_SPARSE_MIN_SAMPLES} "
+                      f"TPGs or {_SPARSE_MIN_EVENTS} dispatch events — treat "
+                      f"the mean and its residual with caution")
         print(bar)
 
 
 # --------------------------------------------------------------------------- #
-# Collection + fitting
+# Collection
 # --------------------------------------------------------------------------- #
 
 class DispatchAnalyzer:
@@ -247,8 +397,9 @@ class DispatchAnalyzer:
             names = ([uarch_name] if uarch_name is not None
                      else sorted(tpg.dispatch_latencies))
             for name in names:
-                for size in sorted(tpg.get_dispatches(name)):
-                    dm = tpg.get_dispatches(name)[size]
+                dispatches = tpg.get_dispatches(name)
+                for size in sorted(dispatches):
+                    dm = dispatches[size]
                     samples.append(
                         DispatchSample(
                             tpg_name=tpg.name,
@@ -263,44 +414,45 @@ class DispatchAnalyzer:
         return samples
 
     @staticmethod
+    def filter_by_events(
+        samples: list[DispatchSample],
+        min_events: int = _SPARSE_MIN_EVENTS,
+        min_tpgs: int = 0,
+    ) -> tuple[list[DispatchSample], list[DispatchSizeStat]]:
+        """
+        Drop every sample whose *dispatch size* rests on too little evidence.
+
+        The threshold is applied to the size's **total** across all TPGs, not
+        to individual samples: one TPG contributes only a few tens of dispatch
+        events even for common sizes, so a per-sample threshold would discard
+        everything.  A size backed by, say, 29 events spread over 3 TPGs is a
+        mean of almost nothing, and a single contaminated run there moves it
+        far more than any real effect — such rows distort a fit while
+        contributing nothing it can learn from.
+
+        Args:
+            samples:    Samples to filter.
+            min_events: Minimum total dispatch events for a size to be kept.
+            min_tpgs:   Minimum number of contributing TPGs for a size.
+
+        Returns:
+            ``(kept_samples, dropped_size_stats)`` — the stats of the removed
+            sizes, so the caller can report exactly what was excluded.
+        """
+        stats = DispatchAnalyzer.size_stats(samples)
+        dropped = [st for st in stats
+                   if st.n_events < min_events or st.n_samples < min_tpgs]
+        dropped_sizes = {st.dispatch_size for st in dropped}
+        kept = [s for s in samples if s.dispatch_size not in dropped_sizes]
+        return kept, dropped
+
+    @staticmethod
     def uarchs_with_dispatch_data(db: "Database") -> list[str]:
         """Uarch names for which at least one TPG has dispatch measurements."""
         names: set[str] = set()
         for tpg in db.tpgs.values():
             names.update(n for n, d in tpg.dispatch_latencies.items() if d)
         return sorted(names)
-
-    # ------------------------------------------------------------------ #
-    # Summary printing
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def print_summary(db: "Database") -> None:
-        """Print the dispatch section of ``Database.print_summary``."""
-        uarch_names = DispatchAnalyzer.uarchs_with_dispatch_data(db)
-        if not uarch_names:
-            return
-
-        print("\n" + "═" * 70)
-        print("  DISPATCH INSTRUMENTATION")
-        print("    one row per dispatch size, pooled over all loaded TPGs")
-        print("═" * 70)
-
-        for name in uarch_names:
-            samples = DispatchAnalyzer.collect_samples(db, name)
-            stats = DispatchAnalyzer.size_stats(samples)
-            n_tpgs = len({s.tpg_source_path for s in samples})
-            print(f"\n  uarch: {name}   ({len(samples)} samples "
-                  f"from {n_tpgs} TPG(s))")
-            header = (f"    {'size':>4} {'nTPG':>5} {'events':>8} "
-                      f"{'mean':>9} {'min':>8} {'max':>8}")
-            print(header)
-            print("    " + "-" * (len(header) - 4))
-            for st in stats:
-                print(f"    {st.dispatch_size:>4} {st.n_samples:>5} "
-                      f"{st.n_events:>8} {st.mean_latency:>9.2f} "
-                      f"{st.min_latency:>8.1f} {st.max_latency:>8.1f}")
-        print("═" * 70)
 
     @staticmethod
     def size_stats(samples: list[DispatchSample]) -> list[DispatchSizeStat]:
@@ -325,6 +477,99 @@ class DispatchAnalyzer:
             )
         return stats
 
+    @staticmethod
+    def _deltas(stats: list[DispatchSizeStat]) -> list[tuple[int, float]]:
+        """``(size, Δ mean latency per unit of size)`` for consecutive stats."""
+        out: list[tuple[int, float]] = []
+        for prev, cur in zip(stats, stats[1:]):
+            gap = cur.dispatch_size - prev.dispatch_size
+            if gap > 0:
+                out.append((cur.dispatch_size,
+                            (cur.mean_latency - prev.mean_latency) / gap))
+        return out
+
+    @staticmethod
+    def marginal_costs(samples: list[DispatchSample]) -> list[tuple[int, float]]:
+        """
+        Step-to-step differences of the per-size means: ``(size, Δ from the
+        previous size, per unit of size)``.
+
+        A constant sequence means one linear regime; a jump locates a
+        breakpoint candidate.
+        """
+        return DispatchAnalyzer._deltas(DispatchAnalyzer.size_stats(samples))
+
+    @staticmethod
+    def suggest_breakpoint(samples: list[DispatchSample]) -> int | None:
+        """
+        Size at which the marginal cost changes most sharply, or None if the
+        data look like a single regime.
+
+        Sparse sizes are excluded first: a mean resting on one or two TPGs
+        moves far more from a single contaminated measurement than from any
+        real change of regime, and would otherwise capture the suggestion.
+
+        A hint for ``--breakpoint``, not a decision: it reports where the
+        largest jump in per-program cost occurs, provided that jump is at
+        least half again the median marginal cost.
+        """
+        stats = [st for st in DispatchAnalyzer.size_stats(samples)
+                 if not st.is_sparse]
+        deltas = DispatchAnalyzer._deltas(stats)
+        if len(deltas) < 3:
+            return None
+        values = sorted(d for _s, d in deltas)
+        median = values[len(values) // 2]
+        size, worst = max(deltas, key=lambda sd: sd[1])
+        if median > 0 and worst > 1.5 * median:
+            return size
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Summary printing
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def print_summary(db: "Database") -> None:
+        """Print the dispatch section of ``Database.print_summary``."""
+        uarch_names = DispatchAnalyzer.uarchs_with_dispatch_data(db)
+        if not uarch_names:
+            return
+
+        print("\n" + "═" * 70)
+        print("  DISPATCH INSTRUMENTATION")
+        print("    one row per dispatch size, pooled over all loaded TPGs")
+        print("═" * 70)
+
+        for name in uarch_names:
+            samples = DispatchAnalyzer.collect_samples(db, name)
+            stats = DispatchAnalyzer.size_stats(samples)
+            deltas = dict(DispatchAnalyzer.marginal_costs(samples))
+            n_tpgs = len({s.tpg_source_path for s in samples})
+            print(f"\n  uarch: {name}   ({len(samples)} samples "
+                  f"from {n_tpgs} TPG(s))")
+            header = (f"    {'size':>4} {'nTPG':>5} {'events':>8} "
+                      f"{'mean':>9} {'min':>8} {'max':>8} {'Δ/size':>8}")
+            print(header)
+            print("    " + "-" * (len(header) - 4))
+            for st in stats:
+                d = deltas.get(st.dispatch_size)
+                d_str = f"{d:>+8.2f}" if d is not None else f"{'—':>8}"
+                mark = "*" if st.is_sparse else " "
+                print(f"    {st.dispatch_size:>4} {st.n_samples:>5} "
+                      f"{st.n_events:>8} {st.mean_latency:>9.2f} "
+                      f"{st.min_latency:>8.1f} {st.max_latency:>8.1f} "
+                      f"{d_str} {mark}")
+            bp = DispatchAnalyzer.suggest_breakpoint(samples)
+            if bp is not None:
+                print(f"    Δ/size jumps at size {bp} — consider "
+                      f"`train-dispatch --breakpoint {bp}`")
+        print("═" * 70)
+
+
+# --------------------------------------------------------------------------- #
+# Fitting
+# --------------------------------------------------------------------------- #
 
 class DispatchRegressor:
     """
@@ -332,15 +577,17 @@ class DispatchRegressor:
     dispatch latency on dispatch size.
 
     Plain least squares is used rather than the LassoCV of the team-level
-    pipeline: there are only one or two features here, so there is nothing to
-    select and regularisation would only bias the coefficients.
+    pipeline: there are only a handful of features here, so there is nothing
+    to select and regularisation would only bias the coefficients.
     """
 
     @staticmethod
     def train(
         samples:      list[DispatchSample],
         degree:       int   = 1,
+        breakpoint:   int | None = None,
         weighted:     bool  = True,
+        robust:       bool  = False,
         test_size:    float = 0.20,
         random_state: int   = 42,
     ) -> DispatchModel:
@@ -350,9 +597,16 @@ class DispatchRegressor:
         Args:
             samples:      One DispatchSample per (TPG, uarch, size).
             degree:       Polynomial degree in dispatch size (1 = affine).
-            weighted:     Weight each sample by its event count, so that
-                          aggregates averaged over more dispatch events carry
-                          more influence.
+            breakpoint:   Size at which the marginal cost is allowed to change,
+                          adding a level shift and a slope change there.  None
+                          fits a single regime.
+            weighted:     Weight each sample by its event count, so aggregates
+                          averaged over more dispatch events carry more
+                          influence.
+            robust:       Fit with a Huber loss instead of squared error, so a
+                          handful of contaminated aggregates cannot dominate
+                          the coefficients.  Samples it judges outlying are
+                          reported rather than silently dropped.
             test_size:    Fraction held out for evaluation.
             random_state: Seed for the split (reproducibility).
 
@@ -360,19 +614,18 @@ class DispatchRegressor:
             A fitted :class:`DispatchModel`.
 
         Raises:
-            ValueError:  If there are too few samples, or every sample shares
-                         the same dispatch size (nothing to regress on).
+            ValueError:  If the basis is not identifiable from the sizes present.
             ImportError: If scikit-learn / numpy are not installed.
         """
         if len(samples) < 2:
             raise ValueError(
                 f"Need at least 2 dispatch samples to train, got {len(samples)}."
             )
-        distinct_sizes = {s.dispatch_size for s in samples}
+        distinct_sizes = sorted({s.dispatch_size for s in samples})
         if len(distinct_sizes) < 2:
             raise ValueError(
-                "All dispatch samples share the same DispatchSize "
-                f"({distinct_sizes.pop()}); the size coefficient is not "
+                f"All dispatch samples share the same DispatchSize "
+                f"({distinct_sizes[0]}); the size coefficient is not "
                 "identifiable.  Load more TPGs with varied dispatch sizes."
             )
         if degree < 1:
@@ -380,13 +633,21 @@ class DispatchRegressor:
         if degree >= len(distinct_sizes):
             raise ValueError(
                 f"degree {degree} needs more than {degree} distinct dispatch "
-                f"sizes, only {len(distinct_sizes)} present "
-                f"({sorted(distinct_sizes)})."
+                f"sizes, only {len(distinct_sizes)} present ({distinct_sizes})."
             )
+        if breakpoint is not None:
+            below = [s for s in distinct_sizes if s < breakpoint]
+            above = [s for s in distinct_sizes if s >= breakpoint]
+            if len(below) < 2 or len(above) < 2:
+                raise ValueError(
+                    f"breakpoint {breakpoint} needs at least 2 distinct sizes "
+                    f"on each side; got {below} below and {above} at/above.  "
+                    f"Available sizes: {distinct_sizes}."
+                )
 
         try:
             import numpy as np
-            from sklearn.linear_model import LinearRegression
+            from sklearn.linear_model import HuberRegressor, LinearRegression
             from sklearn.model_selection import train_test_split
             from sklearn.metrics import (mean_absolute_error,
                                          mean_squared_error, r2_score)
@@ -395,49 +656,85 @@ class DispatchRegressor:
                 "scikit-learn and numpy are required for DispatchRegressor.train()"
             ) from exc
 
-        names = _feature_names(degree)
-        X = np.array([_design_row(s.dispatch_size, degree) for s in samples])
+        names = _feature_names(degree, breakpoint)
+        X = np.array([_design_row(s.dispatch_size, degree, breakpoint)
+                      for s in samples])
         y = np.array([s.latency for s in samples], dtype=float)
         w = np.array([max(s.nb_measurements, 1) for s in samples], dtype=float)
+        sizes = np.array([s.dispatch_size for s in samples], dtype=float)
 
         # ── 80 / 20 split ────────────────────────────────────────────────
         # Below 5 samples a held-out fold is meaningless; fit on everything
         # and say so, mirroring the team-level Regressor.
+        idx = np.arange(len(samples))
         if len(samples) < 5:
             print(f"[DispatchRegressor] Warning: only {len(samples)} samples — "
                   f"skipping train/test split, fitting on full dataset.")
-            X_train, X_test, y_train, y_test = X, X, y, y
-            w_train = w
+            idx_train, idx_test = idx, idx
             n_test = 0
         else:
-            (X_train, X_test, y_train, y_test,
-             w_train, _w_test) = train_test_split(
-                X, y, w, test_size=test_size, random_state=random_state,
+            idx_train, idx_test = train_test_split(
+                idx, test_size=test_size, random_state=random_state,
             )
-            n_test = len(y_test)
+            n_test = len(idx_test)
 
-        model = LinearRegression()
-        model.fit(X_train, y_train,
-                  sample_weight=w_train if weighted else None)
+        X_train, X_test = X[idx_train], X[idx_test]
+        y_train, y_test = y[idx_train], y[idx_test]
+        w_train = w[idx_train]
+        sz_train, sz_test = sizes[idx_train], sizes[idx_test]
 
-        def _metrics(X_fold, y_fold) -> RegressionMetrics:
-            y_pred = model.predict(X_fold)
+        if robust:
+            # Huber: squared loss on small residuals, linear beyond epsilon,
+            # so a contaminated aggregate cannot pull the line towards itself.
+            # alpha=0 keeps the coefficients unregularised and comparable.
+            model = HuberRegressor(epsilon=1.35, alpha=0.0, max_iter=1000)
+            model.fit(X_train, y_train,
+                      sample_weight=w_train if weighted else None)
+        else:
+            model = LinearRegression()
+            model.fit(X_train, y_train,
+                      sample_weight=w_train if weighted else None)
+
+        def _metrics(y_true, y_pred) -> RegressionMetrics:
             return RegressionMetrics(
-                mae  = float(mean_absolute_error(y_fold, y_pred)),
-                rmse = float(np.sqrt(mean_squared_error(y_fold, y_pred))),
-                r2   = float(r2_score(y_fold, y_pred)),
+                mae  = float(mean_absolute_error(y_true, y_pred)),
+                rmse = float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                r2   = float(r2_score(y_true, y_pred)),
             )
+
+        # ── Saturated baseline ───────────────────────────────────────────
+        # Each size predicted by its own weighted mean over the *training*
+        # fold: the best a model seeing only the size could ever do.  Sizes
+        # absent from the training fold fall back to the global mean.
+        global_mean = float(np.average(y_train, weights=w_train))
+        size_means: dict[float, float] = {}
+        for size in np.unique(sz_train):
+            mask = sz_train == size
+            size_means[float(size)] = float(
+                np.average(y_train[mask], weights=w_train[mask])
+            )
+
+        def _saturated(sz) -> "np.ndarray":
+            return np.array([size_means.get(float(s), global_mean) for s in sz])
 
         weights = {name: float(c) for name, c in zip(names, model.coef_)}
 
-        # Per-size breakdown, with the model's prediction alongside.
+        # Per-size breakdown over all samples, with the model's prediction.
         stats = DispatchAnalyzer.size_stats(samples)
         for st in stats:
-            st.predicted = float(
-                model.predict(np.array([_design_row(st.dispatch_size, degree)]))[0]
-            )
+            st.predicted = float(model.predict(
+                np.array([_design_row(st.dispatch_size, degree, breakpoint)])
+            )[0])
 
-        # How much RMSE the measurement noise alone accounts for.
+        # Samples the fit cannot account for: residual greater than three
+        # times the typical error.  Reported for both estimators — under
+        # least squares these are the points distorting the coefficients,
+        # under Huber they are the points it successfully resisted.
+        resid_train = y_train - model.predict(X_train)
+        threshold = 3.0 * float(np.mean(np.abs(resid_train)))
+        flagged = [samples[i] for i, r in zip(idx_train, resid_train)
+                   if abs(r) > threshold] if threshold > 0 else []
+
         sems = np.array([s.sem for s in samples], dtype=float)
         noise_floor = float(np.sqrt(np.mean(sems ** 2))) if len(sems) else 0.0
 
@@ -445,6 +742,7 @@ class DispatchRegressor:
             weights       = weights,
             bias          = float(model.intercept_),
             degree        = degree,
+            breakpoint    = breakpoint,
             weighted      = weighted,
             feature_names = names,
             split         = TrainTestSplit(
@@ -453,10 +751,16 @@ class DispatchRegressor:
                 n_test       = n_test,
                 random_state = random_state,
             ),
-            train_metrics = _metrics(X_train, y_train),
-            test_metrics  = _metrics(X_test, y_test) if n_test > 0 else None,
+            train_metrics = _metrics(y_train, model.predict(X_train)),
+            test_metrics  = (_metrics(y_test, model.predict(X_test))
+                             if n_test > 0 else None),
+            saturated_train_metrics = _metrics(y_train, _saturated(sz_train)),
+            saturated_test_metrics  = (_metrics(y_test, _saturated(sz_test))
+                                       if n_test > 0 else None),
             size_stats    = stats,
             noise_floor   = noise_floor,
+            estimator     = "huber" if robust else "least squares",
+            flagged_outliers = flagged,
         )
 
     @staticmethod
