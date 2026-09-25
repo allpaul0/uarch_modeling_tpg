@@ -177,15 +177,12 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
         print(f"\n[train-dispatch] {len(samples)} samples  "
               f"uarch={uarch_name!r}  TPGs={n_tpgs}  sizes={sizes}")
 
+        # "auto" is resolved inside the regressor, after the train/test split
+        # and using training samples only — selecting it out here would let
+        # the held-out fold shape the model's structure.
         breakpoint_ = args.breakpoint
         if breakpoint_ is None and args.auto_breakpoint:
-            breakpoint_ = DispatchAnalyzer.suggest_breakpoint(samples)
-            if breakpoint_ is not None:
-                print(f"[train-dispatch] auto-detected breakpoint at size "
-                      f"{breakpoint_}")
-            else:
-                print("[train-dispatch] no clear breakpoint detected — "
-                      "fitting a single regime")
+            breakpoint_ = "auto"
 
         try:
             model = DispatchRegressor.train(
@@ -196,6 +193,10 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
                 robust=args.robust,
                 test_size=args.test_size,
                 random_state=args.seed,
+                min_segment=args.min_segment,
+                cv_splits=args.cv_splits,
+                select_margin=args.select_margin,
+                n_bootstrap=args.bootstrap,
             )
         except ValueError as exc:
             print(f"[train-dispatch] {exc}")
@@ -206,9 +207,10 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
         if breakpoint_ is None:
             hint = DispatchAnalyzer.suggest_breakpoint(samples)
             if hint is not None:
-                print(f"\n  Hint: the marginal cost jumps at size {hint}. "
-                      f"A polynomial cannot fit a step — try "
-                      f"`--breakpoint {hint}`.")
+                print(f"\n  Hint: the marginal cost changes sharply around "
+                      f"size {hint}. A polynomial cannot fit a step — try "
+                      f"`--auto-breakpoint`, which selects it on the training "
+                      f"fold so the test metrics stay honest.")
 
 
 def main() -> None:
@@ -258,6 +260,19 @@ def main() -> None:
     p_td.add_argument("--auto-breakpoint", action="store_true",
                       help="Detect the breakpoint from the data instead of "
                            "passing it explicitly")
+    p_td.add_argument("--min-segment", type=int, default=2,
+                      help="Distinct sizes required on each side of a "
+                           "breakpoint (default: 2, the identifiability "
+                           "minimum; 3+ also tests each segment's linearity)")
+    p_td.add_argument("--cv-splits", type=int, default=5,
+                      help="Folds used by --auto-breakpoint (default: 5)")
+    p_td.add_argument("--select-margin", type=float, default=0.0,
+                      help="CV MAE improvement a breakpoint must achieve to be "
+                           "preferred over a single regime (default: 0)")
+    p_td.add_argument("--bootstrap", type=int, default=0,
+                      help="Bootstrap resamples clustered on TPGs, for "
+                           "confidence intervals and breakpoint stability "
+                           "(default: 0 = skip)")
     p_td.add_argument("--min-events", type=int, default=100,
                       help="Ignore dispatch sizes whose total event count "
                            "across all TPGs is below this (default: 100; "

@@ -156,6 +156,74 @@ class DispatchSizeStat:
                 or self.n_events < _SPARSE_MIN_EVENTS)
 
 
+@dataclass
+class BreakpointCandidate:
+    """Cross-validated score of one candidate breakpoint (None = single regime)."""
+    breakpoint: int | None
+    cv_mae: float
+    cv_rmse: float
+    n_folds: int
+    chosen: bool = False
+
+
+@dataclass
+class BreakpointSelection:
+    """
+    Outcome of choosing a breakpoint, with the evidence behind it.
+
+    The scan runs entirely inside the training fold, using grouped
+    cross-validation with TPGs as groups: no held-out sample influences the
+    choice, and samples from one TPG never straddle a CV fold (they come from
+    one binary and are correlated, so splitting them would flatter every
+    candidate and reward overfitting).
+
+    Attributes
+    ----------
+    candidates:   Every candidate scored, single-regime first.
+    chosen:       Selected breakpoint, or None if no candidate beat the
+                  single-regime baseline by ``margin``.
+    baseline_mae: CV MAE of the single-regime model.
+    margin:       Improvement in CV MAE a breakpoint had to achieve to be kept.
+    min_segment:  Distinct sizes required on each side of a candidate.
+    """
+    candidates: list[BreakpointCandidate] = field(default_factory=list)
+    chosen: int | None = None
+    baseline_mae: float = 0.0
+    margin: float = 0.0
+    min_segment: int = 2
+
+    def print_table(self, indent: str = "  ") -> None:
+        if not self.candidates:
+            return
+        print(f"\n{indent}Breakpoint selection "
+              f"(grouped {self.candidates[0].n_folds}-fold CV, training fold "
+              f"only, groups = TPGs):")
+        print(f"{indent}  {'candidate':>10} {'CV MAE':>9} {'CV RMSE':>9} "
+              f"{'vs single':>10}")
+        for c in self.candidates:
+            label = "none" if c.breakpoint is None else f"K={c.breakpoint}"
+            delta = ("" if c.breakpoint is None
+                     else f"{c.cv_mae - self.baseline_mae:+.3f}")
+            mark = "  <- chosen" if c.chosen else ""
+            print(f"{indent}  {label:>10} {c.cv_mae:>9.3f} {c.cv_rmse:>9.3f} "
+                  f"{delta:>10}{mark}")
+        if self.chosen is None:
+            print(f"{indent}  no candidate improved on the single regime by "
+                  f"more than {self.margin:.3f} MAE — fitting one regime")
+
+
+@dataclass
+class BootstrapInterval:
+    """Percentile confidence interval for one quantity from a cluster bootstrap."""
+    name: str
+    point: float
+    low: float
+    high: float
+
+    def __repr__(self) -> str:
+        return f"{self.name}={self.point:.3f} [{self.low:.3f}, {self.high:.3f}]"
+
+
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
@@ -200,6 +268,10 @@ class DispatchModel:
     noise_floor:   float = 0.0
     estimator:     str = "least squares"
     flagged_outliers: list["DispatchSample"] = field(default_factory=list)
+    selection:     "BreakpointSelection | None" = None
+    bootstrap:     list["BootstrapInterval"] = field(default_factory=list)
+    bootstrap_breakpoints: dict = field(default_factory=dict)
+    thin_segments: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Prediction
@@ -296,6 +368,29 @@ class DispatchModel:
                   f"{self.marginal_cost_high:+.2f} cycles")
             print(f"    one-off step at size {self.breakpoint}: "
                   f"{self.step_at_breakpoint:+.2f} cycles")
+
+        if self.thin_segments:
+            for msg in self.thin_segments:
+                print(f"  Note: {msg}")
+
+        if self.selection is not None:
+            self.selection.print_table(indent="  ")
+
+        if self.bootstrap:
+            n_boot = sum(self.bootstrap_breakpoints.values())
+            print(f"\n  Cluster bootstrap over TPGs ({n_boot} resamples, "
+                  f"95% percentile intervals):")
+            for ci in self.bootstrap:
+                print(f"    {ci.name:<26} {ci.point:>9.3f}  "
+                      f"[{ci.low:>8.3f}, {ci.high:>8.3f}]")
+            if self.selection is not None and self.bootstrap_breakpoints:
+                picks = ", ".join(
+                    f"{'none' if k is None else f'K={k}'}: {v / n_boot:.0%}"
+                    for k, v in sorted(self.bootstrap_breakpoints.items(),
+                                       key=lambda kv: -kv[1]))
+                print(f"    breakpoint re-selected as  {picks}"
+                      + ("   (unanimous)"
+                         if len(self.bootstrap_breakpoints) == 1 else ""))
 
         if self.train_metrics:
             print(f"\n  Train metrics:  {self.train_metrics}")
@@ -525,6 +620,107 @@ class DispatchAnalyzer:
             return size
         return None
 
+    @staticmethod
+    def select_breakpoint(
+        samples:      list[DispatchSample],
+        degree:       int = 1,
+        weighted:     bool = True,
+        robust:       bool = False,
+        min_segment:  int = 2,
+        n_splits:     int = 5,
+        margin:       float = 0.0,
+    ) -> "BreakpointSelection":
+        """
+        Choose a breakpoint by grouped cross-validation *within the samples
+        given* — never on a held-out fold.
+
+        Every candidate size with at least ``min_segment`` distinct sizes on
+        each side is scored, along with the single-regime baseline, by
+        out-of-fold weighted MAE.  Folds are grouped by TPG so that samples
+        from one binary never appear in both the fit and the score of a fold;
+        they are correlated, and splitting them would make every candidate
+        look better than it is.
+
+        MAE is the score rather than RMSE because a single contaminated
+        aggregate should not decide the shape of the model.
+
+        A candidate is chosen only if it improves on the single-regime
+        baseline by more than ``margin`` — a breakpoint costs two parameters
+        and has to earn them.
+
+        Args:
+            samples:     Samples to select on (typically the training fold).
+            degree:      Polynomial degree of the base model.
+            weighted:    Weight samples by their event count.
+            robust:      Score using the same estimator that will be fitted.
+            min_segment: Distinct sizes required on each side of a candidate.
+            n_splits:    Cross-validation folds (capped by the number of TPGs).
+            margin:      MAE improvement a breakpoint must achieve.
+
+        Returns:
+            A :class:`BreakpointSelection` holding the scan and the choice.
+        """
+        import numpy as np
+        from sklearn.model_selection import GroupKFold
+
+        sizes = sorted({s.dispatch_size for s in samples})
+        groups = np.array([s.tpg_source_path for s in samples])
+        n_groups = len(set(groups))
+        n_splits = max(2, min(n_splits, n_groups))
+
+        y = np.array([s.latency for s in samples], dtype=float)
+        w = np.array([max(s.nb_measurements, 1) for s in samples], dtype=float)
+
+        candidates: list[int | None] = [None] + _candidate_breakpoints(
+            sizes, min_segment)
+
+        results: list[BreakpointCandidate] = []
+        for bp in candidates:
+            X = np.array([_design_row(s.dispatch_size, degree, bp)
+                          for s in samples])
+            errs: list[float] = []
+            wts:  list[float] = []
+            splitter = GroupKFold(n_splits=n_splits)
+            for tr, va in splitter.split(X, y, groups=groups):
+                if len(tr) < X.shape[1] + 1:
+                    continue
+                try:
+                    model = _fit_estimator(X[tr], y[tr], w[tr], robust, weighted)
+                    pred = model.predict(X[va])
+                except Exception:
+                    continue
+                errs.extend(np.abs(y[va] - pred))
+                wts.extend(w[va])
+            if not errs:
+                continue
+            e = np.array(errs)
+            ww = np.array(wts)
+            results.append(
+                BreakpointCandidate(
+                    breakpoint=bp,
+                    cv_mae=float(np.average(e, weights=ww)),
+                    cv_rmse=float(np.sqrt(np.average(e ** 2, weights=ww))),
+                    n_folds=n_splits,
+                )
+            )
+
+        selection = BreakpointSelection(candidates=results, margin=margin,
+                                        min_segment=min_segment)
+        baseline = next((r for r in results if r.breakpoint is None), None)
+        if baseline is None:
+            return selection
+        selection.baseline_mae = baseline.cv_mae
+
+        with_bp = [r for r in results if r.breakpoint is not None]
+        if with_bp:
+            best = min(with_bp, key=lambda r: r.cv_mae)
+            if best.cv_mae < baseline.cv_mae - margin:
+                best.chosen = True
+                selection.chosen = best.breakpoint
+                return selection
+        baseline.chosen = True
+        return selection
+
     # ------------------------------------------------------------------ #
     # Summary printing
     # ------------------------------------------------------------------ #
@@ -571,6 +767,27 @@ class DispatchAnalyzer:
 # Fitting
 # --------------------------------------------------------------------------- #
 
+def _fit_estimator(X, y, w, robust: bool, weighted: bool):
+    """Fit one linear model (Huber or least squares) on a design matrix."""
+    from sklearn.linear_model import HuberRegressor, LinearRegression
+    if robust:
+        # Huber: squared loss on small residuals, linear beyond epsilon, so a
+        # contaminated aggregate cannot pull the line towards itself.
+        # alpha=0 keeps the coefficients unregularised and comparable to LS.
+        model = HuberRegressor(epsilon=1.35, alpha=0.0, max_iter=1000)
+    else:
+        model = LinearRegression()
+    model.fit(X, y, sample_weight=w if weighted else None)
+    return model
+
+
+def _candidate_breakpoints(sizes: list[int], min_segment: int) -> list[int]:
+    """Sizes with at least *min_segment* distinct sizes strictly below and at/above."""
+    return [k for k in sizes
+            if len([s for s in sizes if s < k]) >= min_segment
+            and len([s for s in sizes if s >= k]) >= min_segment]
+
+
 class DispatchRegressor:
     """
     Fits :class:`DispatchModel` — a (weighted) least-squares regression of
@@ -585,11 +802,15 @@ class DispatchRegressor:
     def train(
         samples:      list[DispatchSample],
         degree:       int   = 1,
-        breakpoint:   int | None = None,
+        breakpoint:   "int | str | None" = None,
         weighted:     bool  = True,
         robust:       bool  = False,
         test_size:    float = 0.20,
         random_state: int   = 42,
+        min_segment:  int   = 2,
+        cv_splits:    int   = 5,
+        select_margin: float = 0.0,
+        n_bootstrap:  int   = 0,
     ) -> DispatchModel:
         """
         Fit a dispatch model on *samples*.
@@ -599,7 +820,10 @@ class DispatchRegressor:
             degree:       Polynomial degree in dispatch size (1 = affine).
             breakpoint:   Size at which the marginal cost is allowed to change,
                           adding a level shift and a slope change there.  None
-                          fits a single regime.
+                          fits a single regime.  ``"auto"`` selects it by
+                          grouped cross-validation *inside the training fold*,
+                          so the held-out fold influences neither the
+                          coefficients nor the structure of the model.
             weighted:     Weight each sample by its event count, so aggregates
                           averaged over more dispatch events carry more
                           influence.
@@ -609,6 +833,17 @@ class DispatchRegressor:
                           reported rather than silently dropped.
             test_size:    Fraction held out for evaluation.
             random_state: Seed for the split (reproducibility).
+            min_segment:  Distinct sizes required on each side of a candidate
+                          breakpoint.  Two is the identifiability minimum; a
+                          segment with exactly two sizes has no residual
+                          degrees of freedom, so its linearity is untested.
+            cv_splits:    Folds used by the automatic selection.
+            select_margin: CV MAE improvement a breakpoint must achieve to be
+                          preferred over a single regime.
+            n_bootstrap:  Resamples for a bootstrap clustered on TPGs; 0 skips
+                          it.  Gives confidence intervals for the reported
+                          quantities and, under ``"auto"``, how often each
+                          breakpoint is re-selected.
 
         Returns:
             A fitted :class:`DispatchModel`.
@@ -635,19 +870,26 @@ class DispatchRegressor:
                 f"degree {degree} needs more than {degree} distinct dispatch "
                 f"sizes, only {len(distinct_sizes)} present ({distinct_sizes})."
             )
-        if breakpoint is not None:
+        auto_breakpoint = (breakpoint == "auto")
+        if breakpoint is not None and not auto_breakpoint:
             below = [s for s in distinct_sizes if s < breakpoint]
             above = [s for s in distinct_sizes if s >= breakpoint]
-            if len(below) < 2 or len(above) < 2:
+            if len(below) < min_segment or len(above) < min_segment:
                 raise ValueError(
-                    f"breakpoint {breakpoint} needs at least 2 distinct sizes "
-                    f"on each side; got {below} below and {above} at/above.  "
-                    f"Available sizes: {distinct_sizes}."
+                    f"breakpoint {breakpoint} needs at least {min_segment} "
+                    f"distinct sizes on each side; got {below} below and "
+                    f"{above} at/above.  Available sizes: {distinct_sizes}."
                 )
+        if auto_breakpoint and not _candidate_breakpoints(distinct_sizes,
+                                                          min_segment):
+            print(f"[DispatchRegressor] no candidate breakpoint has "
+                  f"{min_segment} distinct sizes on each side of it "
+                  f"({distinct_sizes}) — fitting a single regime.")
+            breakpoint = None
+            auto_breakpoint = False
 
         try:
             import numpy as np
-            from sklearn.linear_model import HuberRegressor, LinearRegression
             from sklearn.model_selection import train_test_split
             from sklearn.metrics import (mean_absolute_error,
                                          mean_squared_error, r2_score)
@@ -656,6 +898,11 @@ class DispatchRegressor:
                 "scikit-learn and numpy are required for DispatchRegressor.train()"
             ) from exc
 
+        # Under "auto" the breakpoint is unknown until the selection has run
+        # on the training fold, so start from the single-regime design and
+        # rebuild once it is known.
+        if auto_breakpoint:
+            breakpoint = None
         names = _feature_names(degree, breakpoint)
         X = np.array([_design_row(s.dispatch_size, degree, breakpoint)
                       for s in samples])
@@ -683,17 +930,25 @@ class DispatchRegressor:
         w_train = w[idx_train]
         sz_train, sz_test = sizes[idx_train], sizes[idx_test]
 
-        if robust:
-            # Huber: squared loss on small residuals, linear beyond epsilon,
-            # so a contaminated aggregate cannot pull the line towards itself.
-            # alpha=0 keeps the coefficients unregularised and comparable.
-            model = HuberRegressor(epsilon=1.35, alpha=0.0, max_iter=1000)
-            model.fit(X_train, y_train,
-                      sample_weight=w_train if weighted else None)
-        else:
-            model = LinearRegression()
-            model.fit(X_train, y_train,
-                      sample_weight=w_train if weighted else None)
+        # ── Breakpoint selection — training fold only ────────────────────
+        # Run after the split, on the training samples alone, so the held-out
+        # fold influences neither the coefficients nor the model's structure.
+        selection: "BreakpointSelection | None" = None
+        if auto_breakpoint:
+            train_samples = [samples[i] for i in idx_train]
+            selection = DispatchAnalyzer.select_breakpoint(
+                train_samples, degree=degree, weighted=weighted, robust=robust,
+                min_segment=min_segment, n_splits=cv_splits,
+                margin=select_margin,
+            )
+            breakpoint = selection.chosen
+            # The design matrix depends on the breakpoint, so rebuild it.
+            names = _feature_names(degree, breakpoint)
+            X = np.array([_design_row(s.dispatch_size, degree, breakpoint)
+                          for s in samples])
+            X_train, X_test = X[idx_train], X[idx_test]
+
+        model = _fit_estimator(X_train, y_train, w_train, robust, weighted)
 
         def _metrics(y_true, y_pred) -> RegressionMetrics:
             return RegressionMetrics(
@@ -738,6 +993,105 @@ class DispatchRegressor:
         sems = np.array([s.sem for s in samples], dtype=float)
         noise_floor = float(np.sqrt(np.mean(sems ** 2))) if len(sems) else 0.0
 
+        # ── Segments resting on the bare identifiability minimum ─────────
+        thin: list[str] = []
+        if breakpoint is not None:
+            below = [s for s in distinct_sizes if s < breakpoint]
+            above = [s for s in distinct_sizes if s >= breakpoint]
+            for label, seg in (("below", below), ("at/above", above)):
+                if len(seg) == 2:
+                    thin.append(
+                        f"the segment {label} size {breakpoint} has only 2 "
+                        f"distinct sizes {seg}; its line passes exactly "
+                        f"through both means, so its linearity is untested")
+
+        # ── Cluster bootstrap over TPGs ──────────────────────────────────
+        # Samples from one TPG share a binary and are correlated, so the
+        # resampling unit is the TPG, not the sample.  Resampling samples
+        # independently would treat correlated observations as independent
+        # evidence and give intervals that are far too narrow.
+        intervals: list[BootstrapInterval] = []
+        bp_counts: dict = {}
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(random_state)
+            train_samples = [samples[i] for i in idx_train]
+            by_tpg: dict[str, list[DispatchSample]] = {}
+            for smp in train_samples:
+                by_tpg.setdefault(smp.tpg_source_path, []).append(smp)
+            tpg_keys = list(by_tpg)
+
+            draws: dict[str, list[float]] = {}
+            for _ in range(n_bootstrap):
+                picked = rng.choice(len(tpg_keys), size=len(tpg_keys),
+                                    replace=True)
+                boot = [smp for i in picked for smp in by_tpg[tpg_keys[i]]]
+                boot_sizes = sorted({s.dispatch_size for s in boot})
+
+                bp_b = breakpoint
+                if auto_breakpoint:
+                    if not _candidate_breakpoints(boot_sizes, min_segment):
+                        bp_b = None
+                    else:
+                        sel_b = DispatchAnalyzer.select_breakpoint(
+                            boot, degree=degree, weighted=weighted,
+                            robust=robust, min_segment=min_segment,
+                            n_splits=cv_splits, margin=select_margin,
+                        )
+                        bp_b = sel_b.chosen
+                bp_counts[bp_b] = bp_counts.get(bp_b, 0) + 1
+
+                Xb = np.array([_design_row(s.dispatch_size, degree, bp_b)
+                               for s in boot])
+                yb = np.array([s.latency for s in boot], dtype=float)
+                wb = np.array([max(s.nb_measurements, 1) for s in boot],
+                              dtype=float)
+                if len(boot) <= Xb.shape[1]:
+                    continue
+                try:
+                    mb = _fit_estimator(Xb, yb, wb, robust, weighted)
+                except Exception:
+                    continue
+                nb = _feature_names(degree, bp_b)
+                wmap = dict(zip(nb, (float(c) for c in mb.coef_)))
+                draws.setdefault("bias", []).append(float(mb.intercept_))
+                draws.setdefault("slope (low regime)", []).append(
+                    wmap.get("dispatch_size", float("nan")))
+                if bp_b is not None:
+                    draws.setdefault("slope (high regime)", []).append(
+                        wmap.get("dispatch_size", 0.0)
+                        + wmap.get(f"extra_slope_ge{bp_b}", 0.0))
+                    draws.setdefault("step at breakpoint", []).append(
+                        wmap.get(f"step_ge{bp_b}", 0.0)
+                        + wmap.get(f"extra_slope_ge{bp_b}", 0.0))
+
+            point = {
+                "bias": float(model.intercept_),
+                "slope (low regime)": weights.get("dispatch_size", 0.0),
+            }
+            if breakpoint is not None:
+                point["slope (high regime)"] = (
+                    weights.get("dispatch_size", 0.0)
+                    + weights.get(f"extra_slope_ge{breakpoint}", 0.0))
+                point["step at breakpoint"] = (
+                    weights.get(f"step_ge{breakpoint}", 0.0)
+                    + weights.get(f"extra_slope_ge{breakpoint}", 0.0))
+            for name, vals in draws.items():
+                # Only report quantities the fitted model actually has: on a
+                # single-regime fit some resamples still select a breakpoint,
+                # but a "step" interval would be meaningless there.
+                if name not in point:
+                    continue
+                arr = np.array(vals, dtype=float)
+                arr = arr[~np.isnan(arr)]
+                if arr.size < 2:
+                    continue
+                intervals.append(BootstrapInterval(
+                    name=name,
+                    point=point.get(name, float(np.median(arr))),
+                    low=float(np.percentile(arr, 2.5)),
+                    high=float(np.percentile(arr, 97.5)),
+                ))
+
         return DispatchModel(
             weights       = weights,
             bias          = float(model.intercept_),
@@ -761,6 +1115,10 @@ class DispatchRegressor:
             noise_floor   = noise_floor,
             estimator     = "huber" if robust else "least squares",
             flagged_outliers = flagged,
+            selection     = selection,
+            bootstrap     = intervals,
+            bootstrap_breakpoints = bp_counts,
+            thin_segments = thin,
         )
 
     @staticmethod
