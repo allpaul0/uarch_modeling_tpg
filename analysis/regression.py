@@ -41,8 +41,11 @@ class RegressionModel:
 
     Attributes
     ----------
-    weights:        Non-zero feature coefficients after Lasso regularisation.
-                    Features driven to zero by Lasso are absent from this dict.
+    weights:        Feature coefficients after Lasso regularisation, in
+                    **cycles per occurrence** of the feature — the same units
+                    as the CV32E40X table in disassembler.py, so the two are
+                    directly comparable.  Features Lasso drove to zero are
+                    present with a weight of 0.0.
     bias:           Intercept term.
     feature_names:  Ordered list of ALL features seen during training
                     (including zero-weight ones), needed to rebuild the input
@@ -122,7 +125,7 @@ class RegressionModel:
                 key=lambda kv: abs(kv[1]),
                 reverse=True,
             )
-            print(f"\n  Non-zero weights ({n_nz}):")
+            print(f"\n  Non-zero weights ({n_nz}), in cycles per occurrence:")
             for k, v in top:
                 bar_len = int(abs(v) / max(abs(w) for _, w in top) * 30)
                 direction = "+" if v > 0 else "-"
@@ -247,9 +250,23 @@ class Regressor:
         #print("chosen l1_ratio:", lasso.l1_ratio_)
 
 
+        # ── De-standardise the coefficients ──────────────────────────────
+        # LassoCV was fitted on standardised columns, so lasso.coef_ is in
+        # units of "cycles per standard deviation of the feature".  Stored
+        # as-is they cannot be applied to a raw FeatureVector (predict()
+        # receives unscaled counts) and cannot be read as a per-instruction
+        # cost.  Undoing the scaling is exact — it reproduces lasso.predict()
+        # on raw inputs — and leaves every weight in cycles per occurrence,
+        # directly comparable to the CV32E40X table in disassembler.py.
+        #
+        #   y = intercept + Σ coef_j · (x_j − mean_j) / scale_j
+        #     = [intercept − Σ coef_j · mean_j / scale_j] + Σ (coef_j / scale_j) · x_j
+        coef_raw = lasso.coef_ / scaler.scale_
+        bias_raw = float(lasso.intercept_ - (coef_raw * scaler.mean_).sum())
+
         weights = {
             name: float(coef)
-            for name, coef in zip(all_keys, lasso.coef_)
+            for name, coef in zip(all_keys, coef_raw)
         }
 
         # ── Metrics ──────────────────────────────────────────────────────
@@ -266,7 +283,7 @@ class Regressor:
 
         return RegressionModel(
             weights       = weights,
-            bias          = float(lasso.intercept_),
+            bias          = bias_raw,
             feature_names = all_keys,
             alpha         = float(lasso.alpha_),
             split         = TrainTestSplit(
