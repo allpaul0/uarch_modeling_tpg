@@ -398,6 +398,25 @@ class Disassembler:
         The ``csrr mcycle`` timing probe (first line after each T_start label)
         is stripped from both the instruction list and the raw code text.
 
+        Assumption, and where it breaks.  A team's block is taken to be the
+        lines between its two labels, one team after the other.  The labels
+        only mark basic blocks, though, and the compiler is free to lay those
+        out in another order.  When the library functions are inlined into
+        the teams (``inline`` builds), GCC's block reordering and jump
+        threading can move the end of team n past the start of team n+1.  The
+        file then reads ``T<n>_start … T<n+1>_start … T<n>_end`` and:
+
+          * team n gets no block at all — the loader has no code for it and
+            skips the team;
+          * if ``T<n>_end`` also comes before ``T<n+1>_end``, the block of
+            team n+1 stops there, short of its own end label.
+
+        Both cases are reported in one warning per file; what is returned is
+        unchanged.  Recovering such teams means following the control flow
+        from ``T<n>_start`` to ``T<n>_end`` instead of reading a line range,
+        which this parser does not do.  ``noipa`` builds keep the functions
+        behind calls and do not show the problem.
+
         Returns:
             ``{team_id: TeamBlock}`` — one entry per team in the file.
         """
@@ -406,6 +425,10 @@ class Disassembler:
         probe_consumed: bool = False
         raw_lines: list[str] = []
         instructions: list[Instruction] = []
+        # Overlapping labels: (team left without a block, team that opened
+        # inside it) and (team whose block was cut, team whose end cut it).
+        no_block: list[tuple[int, int]] = []
+        cut_short: list[tuple[int, int]] = []
 
         with open(path, "r") as fh:
             for raw_line in fh:
@@ -417,11 +440,15 @@ class Disassembler:
                     marker = label_m.group(2)
 
                     if marker == "start":
+                        if current_id is not None:
+                            no_block.append((current_id, tid))
                         current_id     = tid
                         probe_consumed = False
                         raw_lines      = [line]
                         instructions   = []
                     elif marker == "end" and current_id is not None:
+                        if tid != current_id:
+                            cut_short.append((current_id, tid))
                         raw_lines.append(line)
                         blocks[current_id] = TeamBlock(
                             team_id=current_id,
@@ -444,6 +471,13 @@ class Disassembler:
                 instr_m = _LINE_RE.search(line)
                 if instr_m:
                     instructions.append(_instruction_from_match(instr_m))
+
+        if no_block or cut_short:
+            details = [f"no block for T{lost} (T{inner}_start comes before T{lost}_end)"
+                       for lost, inner in no_block]
+            details += [f"T{cut} cut short at T{by}_end"
+                        for cut, by in cut_short]
+            print(f"Warning: team labels overlap in {path}: " + "; ".join(details))
 
         return blocks
 
