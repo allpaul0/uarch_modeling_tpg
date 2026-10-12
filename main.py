@@ -13,6 +13,7 @@ Usage
     python main.py train-dispatch --db <path> [--uarch <uarch_name>] [--degree 1]
     python main.py train-dispatch --db <path> --breakpoint 5     # two regimes
     python main.py inventory --db <path> [--isa <isa_name>] [--csv <dir>]
+    python main.py static-args --db <path> [--uarch <uarch_name>] [--header <fixedptc.h>]
 
 Model note (v2)
 ---------------
@@ -231,6 +232,13 @@ def cmd_inventory(args: argparse.Namespace) -> None:
                 print(f"[inventory] wrote {path}")
 
 
+def cmd_static_args(args: argparse.Namespace) -> None:
+    """Calls whose arguments are compile-time constants, per function."""
+    from analysis.static_args import static_args
+
+    static_args(args.db, uarch=args.uarch, header=args.header).print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -326,9 +334,20 @@ def main() -> None:
     p_inv.add_argument("--top", type=int, default=40,
                        help="Rows to print per table (default: 40)")
 
+    p_sa = sub.add_parser("static-args",
+                          help="Classify each call by whether its arguments "
+                               "are compile-time constants (early exits …)")
+    p_sa.add_argument("--db",     required=True, help="Database file")
+    p_sa.add_argument("--uarch",  default=None,
+                      help="Also compare measured latencies per class")
+    p_sa.add_argument("--header", default=None,
+                      help="fixedptc.h to fold constants with (default: the "
+                           "pipeline/parameters/fixedptc.h above the TPGs)")
+
     args = parser.parse_args()
 
     dispatch = {
+        "static-args": cmd_static_args,
         "inventory": cmd_inventory,
         "load":    cmd_load,
         "summary": cmd_summary,
