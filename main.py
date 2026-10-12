@@ -12,6 +12,7 @@ Usage
     python main.py refresh --db <path> [--save <path>]
     python main.py train-dispatch --db <path> [--uarch <uarch_name>] [--degree 1]
     python main.py train-dispatch --db <path> --breakpoint 5     # two regimes
+    python main.py inventory --db <path> [--isa <isa_name>] [--csv <dir>]
 
 Model note (v2)
 ---------------
@@ -213,6 +214,23 @@ def cmd_train_dispatch(args: argparse.Namespace) -> None:
                       f"fold so the test metrics stay honest.")
 
 
+def cmd_inventory(args: argparse.Namespace) -> None:
+    """Operations, calls and branches of every ISA of a database."""
+    from pathlib import Path
+    from analysis.inventory import inventory
+
+    invs = inventory(args.db, isa=args.isa)
+    if not invs:
+        print(f"[inventory] No compiled team for isa={args.isa!r} in {args.db}")
+        sys.exit(1)
+    for isa, inv in invs.items():
+        inv.print(top=args.top)
+        if args.csv:
+            prefix = Path(args.csv) / f"{Path(args.db).name}_{isa}"
+            for path in inv.to_csv(prefix):
+                print(f"[inventory] wrote {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -298,9 +316,20 @@ def main() -> None:
     p_tr.add_argument("--seed",      type=int,   default=42,
                       help="Random seed for the train/test split (default: 42)")
 
+    p_inv = sub.add_parser("inventory",
+                           help="List C operations, asm operations, calls and "
+                                "branches per ISA")
+    p_inv.add_argument("--db",  required=True, help="Database file")
+    p_inv.add_argument("--isa", default=None, help="Restrict to one ISA")
+    p_inv.add_argument("--csv", default=None,
+                       help="Directory to write one CSV per table into")
+    p_inv.add_argument("--top", type=int, default=40,
+                       help="Rows to print per table (default: 40)")
+
     args = parser.parse_args()
 
     dispatch = {
+        "inventory": cmd_inventory,
         "load":    cmd_load,
         "summary": cmd_summary,
         "inspect": cmd_inspect,
