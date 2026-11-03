@@ -1,0 +1,19 @@
+@startuml
+skinparam monochrome true
+skinparam shadowing false
+'skinparam defaultFontName "Latin Modern Roman"
+skinparam defaultFontSize 12
+skinparam classBackgroundColor white
+skinparam classBorderColor black
+skinparam arrowColor black
+hide circle
+left to right direction
+skinparam defaultTextAlignment center
+
+rectangle "source" as src
+rectangle "binary" as bin
+rectangle "cycles" as cyc
+
+src --> bin : compiler gap\n(static transformations)
+bin --> cyc : micro-architecture gap\n(dynamic transformations)
+@enduml

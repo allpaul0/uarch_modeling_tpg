@@ -1,5 +1,12 @@
 @startuml
-
+skinparam monochrome true
+skinparam shadowing false
+'skinparam defaultFontName "Latin Modern Roman"
+skinparam defaultFontSize 12
+skinparam classBackgroundColor white
+skinparam classBorderColor black
+skinparam arrowColor black
+hide circle
 ' ========= V2 =========
 
 ' ===== TPG DOMAIN =====
@@ -27,15 +34,15 @@ TeamCompiled "1" *-- "1..*" Instruction
 
 ' ===== COMPILATION TARGET (assembly level) =====
 class ISA {
-    + name : String n
+    + name : String
 }
 TeamCompiled "1..*" --> "1" ISA : compiled for
 
 ' ===== STATIC FEATURES (per compiled binary, ISA-determined) =====
-class FeatureVector {
+class FeatureSet {
     + values : Map<String, Float>
 }
-TeamCompiled "1" *-- "1" FeatureVector
+TeamCompiled "1" *-- "1" FeatureSet
 
 ' ===== MICROARCHITECTURE =====
 class Uarch {
@@ -59,12 +66,13 @@ class Disassembler {
     + parseLatencyJson(path : String) : TPGLatencyData
 }
 class FeaturesAnalyzer {
-    + analyzeInstructions(instructions : List<Instruction>) : FeatureVector
+    + analyzeInstructions(instructions : 
+    List<Instruction>) : FeatureSet
 }
 Disassembler   ..> TeamCompiled : parses
 Disassembler   ..> Instruction  : produces
 FeaturesAnalyzer ..> Instruction  : analyzes
-FeaturesAnalyzer ..> FeatureVector : produces
+FeaturesAnalyzer ..> FeatureSet : produces
 
 ' ===== LATENCY MODEL =====
 class RegressionModel {
@@ -72,11 +80,12 @@ class RegressionModel {
     + bias : Float
 }
 class Regressor {
-    + train(features : List<FeatureVector>, measurements : List<TeamMeasurement>) : RegressionModel
-    + predict(features : FeatureVector) : Float
+    + train(features : List<FeatureSet>, 
+    measurements List<TeamMeasurement>) : RegressionModel
+    + predict(features : FeatureSet) : Float
 }
 Regressor ..> RegressionModel : produces
-Regressor ..> FeatureVector : takes training data
+Regressor ..> FeatureSet : takes training data
 Regressor ..> TeamMeasurement : takes latency labels
 
 @enduml

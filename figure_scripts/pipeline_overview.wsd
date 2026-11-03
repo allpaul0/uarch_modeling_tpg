@@ -1,0 +1,26 @@
+@startuml
+!theme plain
+left to right direction
+rectangle "TPG\n(teams)" as tpg
+rectangle "Compiled\nteams" as bin
+rectangle "Latency\nmeasurements" as meas
+rectangle "Static\nfeatures" as feat
+database "Dataset" as db
+rectangle "Lasso" as m1
+rectangle "Model B" as m2
+rectangle "Per-class\nmodels" as m3
+rectangle "Evaluation\n(MAPE, R²)" as ev
+
+tpg --> bin : compile
+bin --> meas : run on µarch
+bin --> feat : disassemble\n+ analyze
+meas --> db
+feat --> db
+db --> m1
+db --> m2
+db --> m3
+m1 --> ev
+m2 --> ev
+m3 --> ev
+note bottom of meas : per (ISA, µarch) target
+@enduml
