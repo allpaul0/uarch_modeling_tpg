@@ -248,9 +248,9 @@ def main():
                                      connectionstyle="arc3,rad=0"))
 
     FIG_DIR.mkdir(exist_ok=True)
-    for ext in ("pdf", "svg", "png"):
+    for ext in ("pdf",): #"svg", "png"):
         fig.savefig(FIG_DIR / f"model_cards.{ext}", dpi=240, bbox_inches="tight")
-    print(f"wrote {FIG_DIR / 'model_cards'}.pdf / .svg / .png")
+    print(f"wrote {FIG_DIR / 'model_cards'}.pdf")# / .svg / .png")
 
 
 if __name__ == "__main__":

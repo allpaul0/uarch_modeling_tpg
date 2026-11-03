@@ -8,9 +8,11 @@ Classification of the cycle-count models (no numeric axes).
              simulation: by executing the program cycle by cycle)
 
 Edit ROWS, COLUMNS and MODELS, then re-run:
-    python3 model_classes.py
-Outputs model_classes.pdf (for LaTeX), .svg and .png.
+    python3 figure_scripts/model_classes.py
+Outputs figures/model_classes.pdf (for LaTeX), .svg and .png.
 """
+
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
@@ -42,6 +44,7 @@ MODELS = [
 EMPTY_CELL_TEXT = "—"     # shown in cells with no model; "" to leave blank
 FIG_SIZE = (6.3, 4.6)          # inches; 6.3 in ~ 16 cm text width
 FONT_SIZE = 9.5
+FIG_DIR = Path(__file__).resolve().parent.parent / "figures"   # repo-level figures/
 
 # ---------------------------------------------------------------------------
 # 2. Drawing (no need to touch below for normal edits)
@@ -151,9 +154,10 @@ def main():
         ax.plot([x, x], [HEADER_H, total_h], color=RULE, lw=0.7)
 
     fig.tight_layout(pad=0.2)
-    for ext in ("pdf", "svg", "png"):
-        fig.savefig(f"figures/model_classes.{ext}", dpi=220, bbox_inches="tight")
-    print("wrote model_classes.pdf / .svg / .png")
+    FIG_DIR.mkdir(exist_ok=True)
+    for ext in ("pdf",): #, "svg", "png"):
+        fig.savefig(FIG_DIR / f"model_classes.{ext}", dpi=220, bbox_inches="tight")
+    print(f"wrote {FIG_DIR / 'model_classes'}.pdf") #/ .svg / .png")
 
 
 if __name__ == "__main__":
